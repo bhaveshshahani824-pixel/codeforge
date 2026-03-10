@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+vscode-extension/node_modules/
+vscode-extension/out/
+
+# Build output
+dist/
+target/
+cargo-target/
+
+# Tauri build artifacts
+src-tauri/target/
+
+# Local env / secrets
+.env
+.env.local
+src/supabase.js
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+*.suo
+*.user
+
+# Models (large GGUF files — never commit these)
+*.gguf
+models/
+
+# llama.cpp binaries and DLLs (downloaded at runtime, not part of source)
+*.dll
+*.exe
+llama-server*
+llama-cli*
+llama-bench*
+llama-gguf*
+ggml*
+libomp*
+
+# Claude internal files
+.claude/
+
+# Cargo local config
+.cargo/

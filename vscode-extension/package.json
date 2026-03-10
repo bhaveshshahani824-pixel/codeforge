@@ -1,0 +1,40 @@
+{
+  "name": "codeforgeai-hub",
+  "displayName": "Codeforge AI Hub",
+  "description": "Connect VS Code / Cursor to Codeforge AI for offline AI assistance with your open files",
+  "version": "1.0.0",
+  "publisher": "codeforgeai",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["AI", "Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "codeforgeai.explain",  "title": "Codeforge AI: Explain Selection" },
+      { "command": "codeforgeai.refactor", "title": "Codeforge AI: Refactor Selection" },
+      { "command": "codeforgeai.fix",      "title": "Codeforge AI: Fix Bug in Selection" },
+      { "command": "codeforgeai.comment",  "title": "Codeforge AI: Add Comments" },
+      { "command": "codeforgeai.connect",  "title": "Codeforge AI: Reconnect to Hub" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "codeforgeai.explain",  "when": "editorHasSelection", "group": "codeforgeai@1" },
+        { "command": "codeforgeai.refactor", "when": "editorHasSelection", "group": "codeforgeai@2" },
+        { "command": "codeforgeai.fix",      "when": "editorHasSelection", "group": "codeforgeai@3" },
+        { "command": "codeforgeai.comment",  "when": "editorHasSelection", "group": "codeforgeai@4" }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "build":   "tsc -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
