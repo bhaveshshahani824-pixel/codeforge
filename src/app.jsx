@@ -138,10 +138,8 @@ const CLERK_KEY = "pk_test_aW1tZW5zZS1yb2RlbnQtNTEuY2xlcmsuYWNjb3VudHMuZGV2JA";
 // ─── App version + update config ─────────────────────────────────────────────
 // Bump APP_VERSION with every release so the update banner auto-hides.
 const APP_VERSION = "0.1.0";
-// After you push to GitHub, replace this with your raw URL:
-// "https://raw.githubusercontent.com/YOUR_USER/offlineai/main/latest.json"
-// File format: { "version": "0.2.0", "notes": "What's new…", "url": "https://github.com/YOUR_USER/offlineai/releases/latest" }
-const UPDATE_CHECK_URL = "https://raw.githubusercontent.com/YOUR_USER/offlineai/main/latest.json";
+// GitHub Releases API — returns the latest release JSON (tag_name, body, html_url).
+const UPDATE_CHECK_URL = "https://api.github.com/repos/bhaveshshahani824-pixel/codeforge/releases/latest";
 
 // ─── Hub trial config ─────────────────────────────────────────────────────────
 const HUB_TRIAL_DAYS   = 5;
@@ -1828,14 +1826,21 @@ function OfflineAIApp() {
   // updateAvailable: null (none) | { version, notes, url }
   const [updateAvailable, setUpdateAvailable] = useState(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
 
   useEffect(() => {
     // Check for updates 4 seconds after launch (so app loads first).
     const timer = setTimeout(async () => {
       try {
         const info = await invoke("check_for_update", { url: UPDATE_CHECK_URL });
-        if (info?.version && info.version !== APP_VERSION) {
-          setUpdateAvailable({ version: info.version, notes: info.notes || "", url: info.url || "" });
+        // GitHub releases API uses tag_name (e.g. "v0.2.0") and html_url
+        const latestVersion = (info?.tag_name || info?.version || "").replace(/^v/, "");
+        if (latestVersion && latestVersion !== APP_VERSION) {
+          setUpdateAvailable({
+            version: latestVersion,
+            notes: info.body || info.notes || "",
+            url: info.html_url || info.url || "",
+          });
         }
       } catch {
         // No internet or placeholder URL — silently ignore
@@ -2089,6 +2094,20 @@ function OfflineAIApp() {
     }
   };
 
+  // ── In-app update install (tauri-plugin-updater) ─────────────────────────
+  const installUpdate = async () => {
+    setUpdateInstalling(true);
+    try {
+      await invoke("install_update");
+      // App will restart automatically after install
+    } catch (err) {
+      console.error("[update] install failed:", err);
+      // Fall back to opening the release page in browser
+      if (updateAvailable?.url) window.open(updateAvailable.url, "_blank");
+      setUpdateInstalling(false);
+    }
+  };
+
   // ── Reset server binary and re-download (noavx fallback) ─────────────────
   const resetServer = async () => {
     setSetupProgress({ step: "starting" });
@@ -2321,7 +2340,7 @@ function OfflineAIApp() {
         @keyframes oai-slide{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
         @keyframes oai-slide-bar{0%{margin-left:0;width:40%}50%{margin-left:60%;width:40%}100%{margin-left:0;width:40%}}
         ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:${C.t3};border-radius:4px}
-        textarea{resize:none;outline:none} button{outline:none;border:none}
+        textarea{resize:none;outline:none} button{outline:none;border:none} input{outline:none}
       `}</style>
 
       {/* ── Sidebar ── */}
@@ -2348,7 +2367,7 @@ function OfflineAIApp() {
           <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "7px 10px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 8 }}>
             <Icon d={IC.search} size={12} stroke={C.t3} />
             <input value={sSearch} onChange={e => setSSearch(e.target.value)} placeholder="Search chats…"
-              style={{ background: "none", border: "none", fontSize: 12, color: C.t1, width: "100%", fontFamily: "inherit" }} />
+              style={{ background: "none", border: "none", outline: "none", fontSize: 12, color: C.t1, width: "100%", fontFamily: "inherit", caretColor: C.cyan }} />
           </div>
         </div>
 
@@ -2442,16 +2461,14 @@ function OfflineAIApp() {
               <span style={{ fontSize: 15 }}>🚀</span>
               <span>
                 <strong style={{ color: C.green }}>Codeforge AI v{updateAvailable.version}</strong> is available!
-                {updateAvailable.notes && <span style={{ color: C.t2 }}> — {updateAvailable.notes}</span>}
+                {updateAvailable.notes && <span style={{ color: C.t2, marginLeft: 4 }}>{updateAvailable.notes.split('\n')[0].slice(0, 80)}</span>}
               </span>
             </div>
             <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-              {updateAvailable.url && (
-                <a href={updateAvailable.url} target="_blank" rel="noreferrer"
-                  style={{ padding: "6px 14px", background: C.green, border: "none", borderRadius: 7, color: "#fff", fontSize: 12, fontWeight: 600, textDecoration: "none", whiteSpace: "nowrap" }}>
-                  Update Now
-                </a>
-              )}
+              <Btn onClick={installUpdate} disabled={updateInstalling}
+                style={{ padding: "6px 14px", background: updateInstalling ? C.bgCard : C.green, border: "none", borderRadius: 7, color: "#fff", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", opacity: updateInstalling ? 0.7 : 1 }}>
+                {updateInstalling ? "Installing…" : "Install & Restart"}
+              </Btn>
               <Btn onClick={() => setUpdateDismissed(true)} style={{ padding: "6px 10px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7, color: C.t3, fontSize: 12 }}>
                 Later
               </Btn>

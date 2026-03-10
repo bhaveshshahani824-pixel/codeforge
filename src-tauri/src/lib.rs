@@ -831,12 +831,31 @@ async fn check_for_update(url: String) -> Result<serde_json::Value, String> {
     Ok(json)
 }
 
+/// Download and install a pending update, then restart the app.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| format!("Update check failed: {e}"))?;
+    if let Some(upd) = update {
+        upd.download_and_install(|_downloaded, _total| {}, || {})
+            .await
+            .map_err(|e| format!("Install failed: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(ServerState::new())
         .manage(HubState::new())
         .setup(|app| {
@@ -889,6 +908,7 @@ pub fn run() {
             read_docx,
             pubmed_search,
             check_for_update,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
