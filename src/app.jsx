@@ -137,7 +137,7 @@ const CLERK_KEY = "pk_test_aW1tZW5zZS1yb2RlbnQtNTEuY2xlcmsuYWNjb3VudHMuZGV2JA";
 
 // ─── App version + update config ─────────────────────────────────────────────
 // Bump APP_VERSION with every release so the update banner auto-hides.
-const APP_VERSION = "0.3.3";
+const APP_VERSION = "0.3.4";
 // GitHub Releases API — returns the latest release JSON (tag_name, body, html_url).
 const UPDATE_CHECK_URL = "https://api.github.com/repos/Edu124/Codeforge-ai/releases/latest";
 
@@ -1712,6 +1712,616 @@ const quickPrompts = [
   "Explain this in simple terms",
 ];
 
+// ─── Prompt Templates ─────────────────────────────────────────────────────────
+// Each template has: label, icon (emoji), hint (shown under label), prompt (injected into input)
+// [TOPIC] is the placeholder the user replaces with their subject.
+const TEMPLATE_CATEGORIES = [
+  {
+    id: "education",
+    label: "Education",
+    icon: "🎓",
+    templates: [
+      {
+        label: "MCQ — Quantitative",
+        icon: "🔢",
+        hint: "Numbered problems with 4 options & answers",
+        prompt: `Generate 10 MCQ quantitative questions for MBA entrance exam on the topic: [TOPIC]
+
+Rules (strictly follow):
+- Every question MUST contain specific numbers (prices, percentages, quantities)
+- Every question MUST require a calculation to solve
+- Every question MUST have exactly 4 options: (A) (B) (C) (D)
+- Every question MUST have one correct numerical answer shown at the end
+- Do NOT ask definition or conceptual questions
+
+Example:
+Q1. A trader buys an article for Rs. 450 and sells it for Rs. 540. What is the profit percentage?
+(A) 15%  (B) 20%  (C) 25%  (D) 18%
+Answer: (B) 20%
+
+Now generate 10 questions in exactly this format.`,
+      },
+      {
+        label: "MCQ — Verbal / English",
+        icon: "📝",
+        hint: "Grammar, vocabulary & reading comprehension",
+        prompt: `Generate 10 MCQ verbal ability questions for MBA entrance exam on the topic: [TOPIC]
+
+Rules:
+- Each question must test a specific language skill (grammar rule, vocabulary, sentence correction, etc.)
+- Every question must have exactly 4 options: (A) (B) (C) (D)
+- Include the correct answer with a brief explanation after each question
+- Vary difficulty: 3 easy, 4 medium, 3 hard
+- Do NOT repeat the same question type consecutively
+
+Format:
+Q1. [Question]
+(A) ... (B) ... (C) ... (D) ...
+Answer: (X) — [one-line explanation]
+
+Generate 10 questions now.`,
+      },
+      {
+        label: "Concept Explainer",
+        icon: "💡",
+        hint: "Break down complex topics simply",
+        prompt: `Explain the concept of [TOPIC] clearly and simply.
+
+Structure your response as:
+1. **What it is** — one sentence definition
+2. **Why it matters** — real-world importance
+3. **How it works** — step-by-step breakdown (use numbered points)
+4. **Simple analogy** — relate it to everyday life
+5. **Common mistakes** — 2-3 misconceptions to avoid
+6. **Quick example** — a solved worked example
+
+Keep the language simple enough for a first-year student.`,
+      },
+      {
+        label: "Study Notes",
+        icon: "📚",
+        hint: "Structured revision notes with key points",
+        prompt: `Create comprehensive study notes for the topic: [TOPIC]
+
+Format:
+## [TOPIC] — Study Notes
+
+### Key Definitions
+(bullet list of 5-8 essential terms with concise definitions)
+
+### Core Concepts
+(numbered list of the most important ideas to understand)
+
+### Important Formulas / Rules
+(if applicable — list with brief explanation)
+
+### Common Exam Questions
+(3 typical questions that appear on this topic)
+
+### Quick Revision Summary
+(5 bullet points to remember — most testable facts)`,
+      },
+      {
+        label: "Flashcards",
+        icon: "🃏",
+        hint: "Q&A pairs for active recall practice",
+        prompt: `Generate 15 flashcards for studying: [TOPIC]
+
+Format each flashcard as:
+**Q:** [question]
+**A:** [concise answer — max 2 sentences]
+
+---
+
+Rules:
+- Cover definitions, formulas, applications, and common gotchas
+- Keep answers short enough to memorize
+- Progress from basic to advanced
+- Number each card (Card 1/15, Card 2/15, etc.)`,
+      },
+    ],
+  },
+  {
+    id: "writing",
+    label: "Writing",
+    icon: "✍️",
+    templates: [
+      {
+        label: "Professional Email",
+        icon: "📧",
+        hint: "Formal, clear and action-oriented",
+        prompt: `Write a professional email about: [TOPIC]
+
+Requirements:
+- Subject line: clear and specific
+- Opening: polite and direct
+- Body: explain the purpose in 2-3 short paragraphs
+- Call to action: one clear next step
+- Closing: professional sign-off
+
+Tone: formal but friendly. Keep it under 200 words.`,
+      },
+      {
+        label: "Essay Writer",
+        icon: "📄",
+        hint: "5-paragraph structured essay",
+        prompt: `Write a well-structured essay on: [TOPIC]
+
+Structure:
+**Introduction** (hook + thesis statement)
+
+**Body Paragraph 1** — Main argument with evidence
+**Body Paragraph 2** — Supporting point with example
+**Body Paragraph 3** — Counter-argument + rebuttal
+
+**Conclusion** (restate thesis + broader implication)
+
+Word count: ~400-500 words. Use clear transitions between paragraphs.`,
+      },
+      {
+        label: "Cover Letter",
+        icon: "💼",
+        hint: "Job application cover letter",
+        prompt: `Write a compelling cover letter for: [TOPIC] (e.g. "Software Engineer role at a fintech startup")
+
+Structure:
+- **Opening paragraph**: express interest + how you found the role
+- **Middle paragraph 1**: your most relevant experience and skills
+- **Middle paragraph 2**: specific achievement that proves your value (use numbers if possible)
+- **Closing paragraph**: enthusiasm + call to action (interview request)
+
+Tone: confident, specific, professional. Keep it to one page (~300 words).`,
+      },
+      {
+        label: "Report Summary",
+        icon: "📊",
+        hint: "Executive summary of a report or document",
+        prompt: `Write an executive summary for a report on: [TOPIC]
+
+Include:
+1. **Purpose** — what the report covers and why it matters
+2. **Key Findings** — 3-5 bullet points with the most important data/insights
+3. **Recommendations** — 2-3 actionable next steps
+4. **Conclusion** — one sentence on the overall takeaway
+
+Keep it under 250 words. Use clear, non-technical language suitable for senior management.`,
+      },
+      {
+        label: "Meeting Minutes",
+        icon: "🗒️",
+        hint: "Structured notes from a meeting",
+        prompt: `Generate meeting minutes template for a meeting about: [TOPIC]
+
+Format:
+**Meeting Minutes**
+Date: [Date] | Time: [Time] | Location: [Location]
+Attendees: [Names]
+
+**Agenda Items Discussed:**
+1. [Item 1]
+   - Discussion summary:
+   - Decision made:
+   - Action item: [Who] will [what] by [when]
+
+2. [Item 2]
+   - Discussion summary:
+   - Decision made:
+   - Action item:
+
+**Next Steps Summary:**
+| Action | Owner | Deadline |
+|--------|-------|----------|
+
+**Next Meeting:** [Date/Time]`,
+      },
+    ],
+  },
+  {
+    id: "coding",
+    label: "Coding",
+    icon: "💻",
+    templates: [
+      {
+        label: "Code Review",
+        icon: "🔍",
+        hint: "Analyze code for bugs, style & improvements",
+        prompt: `Review the following [TOPIC] code for:
+
+1. **Bugs & Errors** — logic errors, edge cases, potential crashes
+2. **Performance** — inefficiencies, unnecessary loops, memory issues
+3. **Security** — vulnerabilities, unsafe inputs, injection risks
+4. **Readability** — naming, structure, comments
+5. **Best Practices** — language conventions, design patterns
+
+For each issue found:
+- Quote the problematic line(s)
+- Explain the problem
+- Provide the corrected version
+
+End with an overall score (1-10) and top 3 priority fixes.
+
+[Paste your code below]`,
+      },
+      {
+        label: "Debug Helper",
+        icon: "🐛",
+        hint: "Find and fix errors in code",
+        prompt: `Help me debug this [TOPIC] code.
+
+Please:
+1. **Identify the bug** — what is going wrong and why
+2. **Root cause** — trace the exact source of the error
+3. **Fix** — provide the corrected code with changes highlighted
+4. **Explanation** — explain what the fix does in plain English
+5. **Prevention** — how to avoid this type of error in the future
+
+[Paste your code and error message below]`,
+      },
+      {
+        label: "Explain Code",
+        icon: "🧩",
+        hint: "Line-by-line explanation of code",
+        prompt: `Explain this [TOPIC] code in simple terms.
+
+Please provide:
+1. **Overview** — what does this code do in one sentence?
+2. **Line-by-line breakdown** — explain each significant part
+3. **Data flow** — how data moves through the code
+4. **Dependencies** — what external libraries/functions are used and why
+5. **Example output** — what would this produce given a sample input?
+
+Assume the reader is a beginner. Avoid jargon.
+
+[Paste your code below]`,
+      },
+      {
+        label: "Write Function",
+        icon: "⚙️",
+        hint: "Generate a function with docs & tests",
+        prompt: `Write a [TOPIC] function with the following requirements:
+
+[Describe what the function should do, its inputs, and expected output]
+
+Please provide:
+1. **The function** — clean, well-structured implementation
+2. **Inline comments** — explaining non-obvious logic
+3. **Docstring/JSDoc** — parameters, return type, description
+4. **Edge cases handled** — list what edge cases the code handles
+5. **Unit tests** — 3-5 test cases covering normal + edge cases`,
+      },
+      {
+        label: "Unit Tests",
+        icon: "✅",
+        hint: "Generate test cases for existing code",
+        prompt: `Write comprehensive unit tests for the following [TOPIC] code.
+
+Cover:
+1. **Happy path** — normal expected usage (3+ cases)
+2. **Edge cases** — empty inputs, zero, null, boundary values
+3. **Error cases** — invalid inputs, exceptions that should be thrown
+4. **Integration** — if functions call each other, test the combination
+
+Use the standard testing framework for [TOPIC] (e.g. Jest for JS, pytest for Python).
+Add a comment above each test explaining what it tests.
+
+[Paste your code below]`,
+      },
+    ],
+  },
+  {
+    id: "research",
+    label: "Research",
+    icon: "🔬",
+    templates: [
+      {
+        label: "Research Summary",
+        icon: "📑",
+        hint: "Summarize a paper or article",
+        prompt: `Summarize the research on: [TOPIC]
+
+Structure:
+1. **Research Question** — what problem does this research address?
+2. **Methodology** — how was the research conducted?
+3. **Key Findings** — top 3-5 findings with supporting data
+4. **Limitations** — what are the weaknesses or constraints of the study?
+5. **Implications** — real-world applications of this research
+6. **My Takeaway** — the single most important insight
+
+Be factual and concise. Use bullet points where possible.`,
+      },
+      {
+        label: "Compare & Contrast",
+        icon: "⚖️",
+        hint: "Side-by-side analysis of two things",
+        prompt: `Compare and contrast: [TOPIC] (e.g. "Python vs JavaScript for backend development")
+
+Format:
+| Criteria | Option A | Option B |
+|----------|----------|----------|
+| [aspect] | ... | ... |
+
+Cover these dimensions:
+1. Core differences
+2. Strengths of each
+3. Weaknesses of each
+4. Best use cases for each
+5. **Recommendation** — which to choose and when
+
+Conclude with a clear, opinionated recommendation based on common use cases.`,
+      },
+      {
+        label: "Pros & Cons",
+        icon: "🔄",
+        hint: "Balanced analysis of any topic or decision",
+        prompt: `Provide a detailed pros and cons analysis of: [TOPIC]
+
+**PROS (Advantages)**
+1. [Pro 1] — explanation
+2. [Pro 2] — explanation
+3. [Pro 3] — explanation
+(continue for all significant pros)
+
+**CONS (Disadvantages)**
+1. [Con 1] — explanation
+2. [Con 2] — explanation
+3. [Con 3] — explanation
+(continue for all significant cons)
+
+**Verdict:** [2-3 sentence balanced conclusion with a recommendation]
+
+Base the analysis on facts and real-world evidence.`,
+      },
+      {
+        label: "Literature Review",
+        icon: "📖",
+        hint: "Academic overview of research on a topic",
+        prompt: `Write a literature review outline for the topic: [TOPIC]
+
+Include:
+1. **Introduction** — scope and importance of the topic
+2. **Theoretical Framework** — key theories and models
+3. **Major Research Themes** — 3-4 recurring themes in the literature
+4. **Conflicting Views** — where researchers disagree and why
+5. **Gaps in Research** — what has not been studied yet
+6. **Conclusion** — synthesis and direction for future research
+
+For each section, suggest 2-3 types of sources to look for (e.g. "longitudinal studies on X", "meta-analyses of Y").`,
+      },
+    ],
+  },
+  {
+    id: "business",
+    label: "Business",
+    icon: "📈",
+    templates: [
+      {
+        label: "SWOT Analysis",
+        icon: "🎯",
+        hint: "Strengths, Weaknesses, Opportunities, Threats",
+        prompt: `Perform a SWOT analysis for: [TOPIC] (e.g. "a new coffee shop in a university campus")
+
+| | Strengths | Weaknesses |
+|-|-----------|------------|
+| **Internal** | • [S1] | • [W1] |
+| | • [S2] | • [W2] |
+| | • [S3] | • [W3] |
+
+| | Opportunities | Threats |
+|-|---------------|---------|
+| **External** | • [O1] | • [T1] |
+| | • [O2] | • [T2] |
+| | • [O3] | • [T3] |
+
+**Strategic Insights:**
+- SO Strategy (use strengths to exploit opportunities):
+- WO Strategy (overcome weaknesses using opportunities):
+- ST Strategy (use strengths to counter threats):
+- WT Strategy (minimize weaknesses, avoid threats):`,
+      },
+      {
+        label: "Business Plan",
+        icon: "🏢",
+        hint: "One-page business plan outline",
+        prompt: `Create a one-page business plan for: [TOPIC]
+
+**Executive Summary** (2-3 sentences on what the business does)
+
+**Problem & Solution**
+- Problem: [what pain point does this solve?]
+- Solution: [how does the product/service solve it?]
+
+**Target Market**
+- Primary audience:
+- Market size estimate:
+
+**Revenue Model** (how does it make money?)
+
+**Competitive Advantage** (why will customers choose this over alternatives?)
+
+**Key Milestones** (3-month, 6-month, 1-year goals)
+
+**Financials** (estimated startup cost, monthly burn, break-even point)
+
+**Team** (key roles needed)`,
+      },
+      {
+        label: "Marketing Copy",
+        icon: "📣",
+        hint: "Persuasive product or service copy",
+        prompt: `Write compelling marketing copy for: [TOPIC]
+
+Provide all 3 formats:
+
+**1. Tagline** (5-8 words, memorable)
+
+**2. Short Ad Copy** (30 words — for social media or banner ads)
+
+**3. Full Product Description** (100-150 words — for website or brochure)
+Structure: Hook → Problem → Solution → Benefits (bullet points) → Call to Action
+
+Use persuasive language, focus on benefits not features, and address the target customer's pain points directly.`,
+      },
+      {
+        label: "Job Description",
+        icon: "👔",
+        hint: "Professional job posting",
+        prompt: `Write a professional job description for: [TOPIC] (e.g. "Senior Frontend Developer at a fintech startup")
+
+Include:
+**Job Title:**
+**Location:**
+**Employment Type:**
+
+**About the Role** (2-3 sentences)
+
+**Key Responsibilities** (6-8 bullet points starting with action verbs)
+
+**Required Qualifications** (must-haves)
+
+**Preferred Qualifications** (nice-to-haves)
+
+**What We Offer** (benefits, culture, growth)
+
+**How to Apply**
+
+Keep the tone professional yet welcoming. Avoid jargon and keep requirements realistic.`,
+      },
+    ],
+  },
+  {
+    id: "creative",
+    label: "Creative",
+    icon: "🎨",
+    templates: [
+      {
+        label: "Brainstorm Ideas",
+        icon: "💭",
+        hint: "Generate diverse ideas on any topic",
+        prompt: `Brainstorm 15 creative ideas for: [TOPIC]
+
+Format each idea as:
+**Idea [N]: [Catchy Name]**
+[2-sentence description of the idea and why it's interesting]
+
+Rules:
+- Make ideas diverse — vary from conventional to wild/unconventional
+- Ideas 1-5: practical and easy to implement
+- Ideas 6-10: moderately ambitious
+- Ideas 11-15: bold, creative, or disruptive
+
+End with your top 3 picks and why.`,
+      },
+      {
+        label: "Short Story",
+        icon: "📖",
+        hint: "A complete short story with structure",
+        prompt: `Write a short story about: [TOPIC]
+
+Story structure:
+- **Setup** (introduce character + setting in first paragraph)
+- **Conflict** (introduce the central problem or tension)
+- **Rising action** (2-3 paragraphs building toward climax)
+- **Climax** (the turning point)
+- **Resolution** (satisfying ending)
+
+Guidelines:
+- Show don't tell — use sensory details
+- Include at least one line of dialogue
+- Word count: 350-500 words
+- End with something memorable`,
+      },
+      {
+        label: "Poem",
+        icon: "🌸",
+        hint: "Structured poem with vivid imagery",
+        prompt: `Write a poem about: [TOPIC]
+
+Write it in this format:
+- **3 stanzas of 4 lines each**
+- Use a consistent ABAB or AABB rhyme scheme
+- Include at least 2 vivid metaphors or similes
+- End with a powerful, thought-provoking final line
+
+Then write a second version as **free verse** (no rhyme, but with strong rhythm and imagery).
+
+Label each version clearly.`,
+      },
+      {
+        label: "Product Names",
+        icon: "🏷️",
+        hint: "Creative naming ideas for products or brands",
+        prompt: `Generate 20 creative name ideas for: [TOPIC] (e.g. "a mobile app that tracks water intake")
+
+Group them by style:
+
+**Descriptive Names** (tell what it does)
+**Metaphorical Names** (evoke a feeling or concept)
+**Made-up / Invented Words** (portmanteau, modified words)
+**Short & Punchy** (1-2 syllables, easy to remember)
+**Action-Oriented** (start with a verb)
+
+For each name provide:
+- The name
+- One sentence on the meaning/inspiration
+- Domain availability rating (likely available / might be taken / probably taken)
+
+Highlight your top 5 picks with ⭐`,
+      },
+    ],
+  },
+];
+
+// ─── Template Panel Component ─────────────────────────────────────────────────
+function TemplatePanel({ onSelect, onClose }) {
+  const [activeCategory, setActiveCategory] = useState("education");
+  const cat = TEMPLATE_CATEGORIES.find(c => c.id === activeCategory);
+  return (
+    <div style={{
+      position: "absolute", bottom: "calc(100% + 8px)", left: 0, right: 0,
+      background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 14,
+      boxShadow: "0 -8px 32px rgba(0,0,0,0.5)", zIndex: 200, overflow: "hidden",
+      display: "flex", flexDirection: "column", maxHeight: 420,
+    }}>
+      {/* Header */}
+      <div style={{ padding: "12px 16px 0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: C.t1 }}>⚡ Prompt Templates</span>
+        <Btn onClick={onClose} style={{ background: "none", border: "none", color: C.t3, padding: 4, borderRadius: 6 }}>
+          <Icon d={IC.x} size={14} />
+        </Btn>
+      </div>
+      {/* Category tabs */}
+      <div style={{ display: "flex", gap: 4, padding: "10px 16px 0", overflowX: "auto", flexShrink: 0 }}>
+        {TEMPLATE_CATEGORIES.map(c => (
+          <Btn key={c.id} onClick={() => setActiveCategory(c.id)} style={{
+            padding: "5px 12px", borderRadius: 20, fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap",
+            background: activeCategory === c.id ? C.blue : C.bgCard,
+            border: `1px solid ${activeCategory === c.id ? C.blue : C.border}`,
+            color: activeCategory === c.id ? "#fff" : C.t2,
+          }}>
+            {c.icon} {c.label}
+          </Btn>
+        ))}
+      </div>
+      {/* Templates grid */}
+      <div style={{ overflowY: "auto", padding: "10px 16px 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        {cat?.templates.map(t => (
+          <Btn key={t.label} onClick={() => onSelect(t.prompt)} style={{
+            background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 10,
+            padding: "10px 12px", textAlign: "left", display: "flex", flexDirection: "column", gap: 3,
+            cursor: "pointer", transition: "border-color 0.15s",
+          }}
+            onMouseEnter={e => e.currentTarget.style.borderColor = C.blue}
+            onMouseLeave={e => e.currentTarget.style.borderColor = C.border}
+          >
+            <span style={{ fontSize: 13, fontWeight: 600, color: C.t1 }}>{t.icon} {t.label}</span>
+            <span style={{ fontSize: 11, color: C.t3, lineHeight: 1.4 }}>{t.hint}</span>
+          </Btn>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── Login Page ───────────────────────────────────────────────────────────────
 function LoginPage() {
   // Incrementing signInKey force-remounts <SignIn />, resetting it to the
@@ -1792,6 +2402,7 @@ function OfflineAIApp() {
     return 1;
   });
   const [input, setInput] = useState("");
+  const [showTemplates, setShowTemplates] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [showConn, setShowConn] = useState(false);
   const [showMod, setShowMod] = useState(false);
@@ -2652,8 +3263,33 @@ function OfflineAIApp() {
         )}
 
         {/* Input */}
-        <div style={{ padding: "10px 20px 16px", background: C.bgPanel, borderTop: `1px solid ${C.border}` }}>
+        <div style={{ padding: "10px 20px 16px", background: C.bgPanel, borderTop: `1px solid ${C.border}`, position: "relative" }}>
+          {/* Template panel */}
+          {showTemplates && (
+            <TemplatePanel
+              onSelect={prompt => {
+                setInput(prompt);
+                setShowTemplates(false);
+                setTimeout(() => {
+                  if (inputRef.current) {
+                    inputRef.current.focus();
+                    // Select [TOPIC] so user can type immediately
+                    const idx = prompt.indexOf("[TOPIC]");
+                    if (idx !== -1) { inputRef.current.setSelectionRange(idx, idx + 7); }
+                  }
+                }, 50);
+              }}
+              onClose={() => setShowTemplates(false)}
+            />
+          )}
           <div style={{ display: "flex", alignItems: "flex-end", gap: 10, padding: "10px 14px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 14 }}>
+            {/* Templates toggle button */}
+            <Btn onClick={() => setShowTemplates(v => !v)} title="Prompt Templates" style={{
+              flexShrink: 0, padding: "5px 9px", borderRadius: 8, fontSize: 14,
+              background: showTemplates ? C.blue : "transparent",
+              border: `1px solid ${showTemplates ? C.blue : C.border}`,
+              color: showTemplates ? "#fff" : C.t2, lineHeight: 1,
+            }}>⚡</Btn>
             <textarea
               ref={inputRef}
               value={input}
