@@ -137,7 +137,7 @@ const CLERK_KEY = "pk_test_aW1tZW5zZS1yb2RlbnQtNTEuY2xlcmsuYWNjb3VudHMuZGV2JA";
 
 // ─── App version + update config ─────────────────────────────────────────────
 // Bump APP_VERSION with every release so the update banner auto-hides.
-const APP_VERSION = "0.3.2";
+const APP_VERSION = "0.3.3";
 // GitHub Releases API — returns the latest release JSON (tag_name, body, html_url).
 const UPDATE_CHECK_URL = "https://api.github.com/repos/Edu124/Codeforge-ai/releases/latest";
 
@@ -2111,16 +2111,26 @@ function OfflineAIApp() {
   };
 
   // ── In-app update install (tauri-plugin-updater) ─────────────────────────
+  const [updateProgress, setUpdateProgress] = useState(0);
   const installUpdate = async () => {
     setUpdateInstalling(true);
+    setUpdateProgress(0);
+    // Listen for download progress
+    let unlisten;
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen("update-progress", e => setUpdateProgress(e.payload));
+    } catch {}
     try {
       await invoke("install_update");
-      // App will restart automatically after install
+      // app.restart() is called in Rust — app will close and relaunch
     } catch (err) {
       console.error("[update] install failed:", err);
-      // Fall back to opening the release page in browser
-      if (updateAvailable?.url) window.open(updateAvailable.url, "_blank");
+      alert("Update failed: " + err + "\n\nPlease download manually from the website.");
       setUpdateInstalling(false);
+      setUpdateProgress(0);
+    } finally {
+      if (unlisten) unlisten();
     }
   };
 
@@ -2537,7 +2547,7 @@ function OfflineAIApp() {
             <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
               <Btn onClick={installUpdate} disabled={updateInstalling}
                 style={{ padding: "6px 14px", background: updateInstalling ? C.bgCard : C.green, border: "none", borderRadius: 7, color: "#fff", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", opacity: updateInstalling ? 0.7 : 1 }}>
-                {updateInstalling ? "Installing…" : "Install & Restart"}
+                {updateInstalling ? (updateProgress > 0 ? `Downloading… ${updateProgress}%` : "Starting…") : "Install & Restart"}
               </Btn>
               <Btn onClick={() => setUpdateDismissed(true)} style={{ padding: "6px 10px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 7, color: C.t3, fontSize: 12 }}>
                 Later

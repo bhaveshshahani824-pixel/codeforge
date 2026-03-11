@@ -1,11 +1,11 @@
 {
-  "version": "0.3.2",
-  "notes": "Fixed model downloads for users without a D: drive. Models now save to the standard app data folder on any Windows machine.",
+  "version": "0.3.3",
+  "notes": "Fixed Install & Restart button — app now downloads the update, shows progress, and restarts automatically.",
   "pub_date": "2026-03-11T00:00:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbmh2YmlMd2dTZ2pRT1h3Y1lHM1pRZmxsaXVjMXFoVWhBQ0FOcDNBaklid05aYUtYdks5QWtkVVlVWHhsWlUvR1Y5ZWhld2I2T05YTGs1b2diTjhDN0p1QVF5UlpteGdZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzczMjM4OTIzCWZpbGU6Q29kZWZvcmdlIEFJXzAuMy4yX3g2NF9lbi1VUy5tc2kuemlwCnhQWGVNWmN2c3JEMTBGRHl6d081TnFzck5LUVE2ZmxoSHBYcUZMc2djTWhUNTVwK2FJYWdIZ2NrbHZKcG9pOHlUL2dtVGJMd2dUZjlvMEJnbittSkNBPT0K",
-      "url": "https://github.com/Edu124/Codeforge-ai/releases/download/v0.3.2/Codeforge.AI_0.3.2_x64_en-US.msi.zip"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbmh2YmlNd2dTZ2tqcnI0emx6NU1OTk5DN1BCNktia2lNQzZvM25kMEk5SDUrUnArUFY5S1ZyWnlaRjdWN2JaaHFzNURjd0UvYTdGSTVEUi9JVWNrNlpWMW9oSDcrZkFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzczMjM5NzE2CWZpbGU6Q29kZWZvcmdlIEFJXzAuMy4zX3g2NF9lbi1VUy5tc2kuemlwCm9FSnJEbjJIK2J5OG5TVExVZHJRTWw4ajRtUng4dUNIUkJNRHZNMm1KdDhpNVJ6YXZsVGgrUU9PR2VSRVBldkhuVU5Uc3paaW9vcTVkd0ZVWWQ1U0RnPT0K",
+      "url": "https://github.com/Edu124/Codeforge-ai/releases/download/v0.3.3/Codeforge.AI_0.3.3_x64_en-US.msi.zip"
     }
   }
 }

@@ -837,9 +837,17 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("Update check failed: {e}"))?;
     if let Some(upd) = update {
-        upd.download_and_install(|_downloaded, _total| {}, || {})
-            .await
-            .map_err(|e| format!("Install failed: {e}"))?;
+        let app2 = app.clone();
+        upd.download_and_install(
+            |downloaded, total| {
+                let pct = total.map(|t| (downloaded as u64) * 100 / t).unwrap_or(0);
+                let _ = app2.emit("update-progress", pct);
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("Install failed: {e}"))?;
+        app.restart();
     }
     Ok(())
 }
