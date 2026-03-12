@@ -1,10 +1,10 @@
 {
   "version": "0.3.4",
-  "notes": "Prompt Templates: 30+ built-in templates across Education, Writing, Coding, Research, Business, and Creative categories. Fixed update installer signature and restart.",
-  "pub_date": "2026-03-11T00:00:00Z",
+  "notes": "v0.3.4: Financial Analyst extension (link multiple workbooks, valuation, risk analysis, charts, AI chat), Prompt Templates (30+ built-in templates), fixed Install & Restart updater.",
+  "pub_date": "2026-03-12T00:00:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbmh2YmlMd2dTZ3F1em00dUZCWEZpYVNzRWdUSmdTRDlPbXM5NXErSlV6SjlWZ2F4WEg4UUFWR1F5RGJQcWczSkR0UlBGZFY2aVJqTDhRV1Y3bkRFNi9qUkl6QTZTT2dNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzczMjUxNDc2CWZpbGU6Q29kZWZvcmdlIEFJXzAuMy40X3g2NF9lbi1VUy5tc2kuemlwCjVXVjgrNHFyM2c1bHJUQ2RucEd6aGl2NlBOTmVZQy9oSiszRWVKMjlTN3BIcjBKQkZBMjJnU0puczlqVmtHdFU1bC85V3BsU2JvRUpVWmFocFlaN0JRPT0K",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbmh2YmlMd2dTZ20wVGlUbHBianNOaHplR21lRnUvaG04aXBaazRaTkYwQjYxWmV2KzZHVkpzYWFodjE3ZHBkamNwUUt3bms4cm1KcjVEdTJxNEt4bStHTGw3MjRJc1EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzczMzM3NjM5CWZpbGU6Q29kZWZvcmdlIEFJXzAuMy40X3g2NF9lbi1VUy5tc2kuemlwCnRlalZBSS9IOGIwUjJZdkRBb3FvL0VwZ0hXdStQaGJ6UHlEWXZ6dzNqSGJFZnk3bDd3WWcxSGFaMkdYNU54ZlZHd3Npb082LzNTN1FtTWNwa3pWL0NnPT0K",
       "url": "https://github.com/Edu124/Codeforge-ai/releases/download/v0.3.4/Codeforge.AI_0.3.4_x64_en-US.msi.zip"
     }
   }

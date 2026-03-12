@@ -4,6 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readTextFile, readDir } from "@tauri-apps/plugin-fs";
 import { ClerkProvider, SignIn, useAuth } from "@clerk/react";
+import { Chart, registerables } from "chart.js";
+Chart.register(...registerables);
+Chart.defaults.animation = false;
 
 // ─── Color tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -54,6 +57,11 @@ const IC = {
   pdf:      "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8",
   docx:     "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M9 13h6M9 17h4",
   flask:    "M10 2v7.527a2 2 0 0 1-.211.896L4.72 19.63A1 1 0 0 0 5.633 21h12.734a1 1 0 0 0 .912-1.37L14.21 10.423A2 2 0 0 1 14 9.527V2M8.5 2h7",
+  chart:    "M3 3v18h18M7 16l4-4 4 4 4-8",
+  trendUp:  "M22 7l-8.5 8.5-5-5L2 17",
+  barChart: "M18 20V10M12 20V4M6 20v-6",
+  warning:  "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01",
+  info:     "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 8h.01M12 12v4",
 };
 
 // ─── Research Models (GGUF — runs via llama.cpp, no WebView memory limits) ────
@@ -2271,6 +2279,746 @@ Highlight your top 5 picks with ⭐`,
   },
 ];
 
+// ─── Financial Analyst ────────────────────────────────────────────────────────
+
+// Known financial field keywords — handles messy real-world labels
+const FIN_FIELDS = {
+  revenue:       ["revenue", "net revenue", "sales", "turnover", "income from operations", "total income", "gross revenue", "net sales"],
+  grossProfit:   ["gross profit", "gross income"],
+  ebitda:        ["ebitda", "operating profit", "ebit", "operating income", "profit before interest and tax", "pbit"],
+  netProfit:     ["net profit", "net income", "profit after tax", "pat", "profit for the year", "net earnings", "profit after taxation"],
+  cashFlow:      ["cash flow from operations", "operating cash flow", "fcf", "free cash flow", "net cash from operating", "cash generated from operations"],
+  totalAssets:   ["total assets"],
+  totalLiab:     ["total liabilities", "total debt", "total borrowings", "total liab"],
+  currentAssets: ["current assets", "total current assets"],
+  currentLiab:   ["current liabilities", "total current liabilities"],
+  equity:        ["total equity", "shareholders equity", "shareholders fund", "net worth", "stockholders equity", "owners equity"],
+  inventory:     ["inventory", "inventories", "stock"],
+  cash:          ["cash and cash equivalents", "cash and equivalents", "cash at bank"],
+};
+
+// Fuzzy-match a cell label string against known field keywords
+function matchField(label) {
+  if (!label) return null;
+  const l = String(label).toLowerCase().trim();
+  for (const [key, keywords] of Object.entries(FIN_FIELDS)) {
+    for (const kw of keywords) {
+      if (l === kw || l.startsWith(kw) || l.includes(kw)) return key;
+    }
+  }
+  return null;
+}
+
+// Parse a value from a JSON cell (number, string with commas, etc.)
+function toNum(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return v;
+  const s = String(v).replace(/[,\s₹$£€]/g, "").replace(/[()]/g, m => m === "(" ? "-" : "");
+  const n = parseFloat(s);
+  return isNaN(n) ? null : n;
+}
+
+// Format a number as currency with K/M/B suffix
+function fmtCurrency(n, prefix = "") {
+  if (n === null || n === undefined || isNaN(n)) return "N/A";
+  const abs = Math.abs(n);
+  if (abs >= 1e9)  return (n < 0 ? "-" : "") + prefix + (abs / 1e9).toFixed(1) + "B";
+  if (abs >= 1e6)  return (n < 0 ? "-" : "") + prefix + (abs / 1e6).toFixed(1) + "M";
+  if (abs >= 1e3)  return (n < 0 ? "-" : "") + prefix + (abs / 1e3).toFixed(1) + "K";
+  return (n < 0 ? "-" : "") + prefix + abs.toFixed(0);
+}
+
+function fmtPct(n) {
+  if (n === null || isNaN(n)) return "N/A";
+  return (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
+}
+
+/**
+ * Detect financial fields from a sheet's rows.
+ * Handles two orientations:
+ *   ROW-ORIENTED (most common): Row 0 = headers/periods, Col 0 = row label, Col 1+ = values per period
+ *   COL-ORIENTED (transposed):  Col 0 = period, Row 0 = field labels, cells = values
+ * Returns: { periods: string[], fields: { [fieldKey]: number[] } }
+ */
+function detectFinancialRows(rows) {
+  if (!rows || rows.length < 2) return { periods: [], fields: {} };
+
+  // ── Attempt ROW-ORIENTED: first row = period headers, first col = labels ──
+  const headerRow = rows[0];
+  // Periods are columns 1..N in the header row
+  const rawPeriods = headerRow.slice(1).map(v => v != null ? String(v).trim() : "").filter(Boolean);
+
+  const fields = {};
+  let matchCount = 0;
+
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const label = row[0] != null ? String(row[0]).trim() : "";
+    const key = matchField(label);
+    if (!key) continue;
+    // Extract numeric values from col 1 onward (aligned with rawPeriods)
+    const vals = rawPeriods.map((_, i) => toNum(row[i + 1]));
+    if (vals.some(v => v !== null)) {
+      fields[key] = vals;
+      matchCount++;
+    }
+  }
+
+  if (matchCount >= 2) {
+    return { periods: rawPeriods, fields };
+  }
+
+  // ── Attempt COL-ORIENTED: first col = row labels, first row = field labels ──
+  const colFields = {};
+  let colMatchCount = 0;
+  const colLabels = headerRow.map(v => v != null ? String(v).trim() : "");
+  const colPeriods = rows.slice(1).map(r => r[0] != null ? String(r[0]).trim() : "");
+
+  for (let c = 1; c < colLabels.length; c++) {
+    const key = matchField(colLabels[c]);
+    if (!key) continue;
+    const vals = rows.slice(1).map(r => toNum(r[c]));
+    if (vals.some(v => v !== null)) {
+      colFields[key] = vals;
+      colMatchCount++;
+    }
+  }
+
+  if (colMatchCount >= 2) {
+    return { periods: colPeriods, fields: colFields };
+  }
+
+  // ── Last resort: scan all rows for labels anywhere ──
+  const scanFields = {};
+  let scanPeriods = rawPeriods.length ? rawPeriods : [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    for (let c = 0; c < row.length; c++) {
+      const key = matchField(row[c] != null ? String(row[c]) : "");
+      if (!key) continue;
+      const vals = row.slice(c + 1).map(toNum).filter(v => v !== null);
+      if (vals.length > 0 && !scanFields[key]) {
+        scanFields[key] = vals;
+        if (scanPeriods.length < vals.length) {
+          scanPeriods = Array.from({ length: vals.length }, (_, i) => `Period ${i + 1}`);
+        }
+      }
+    }
+  }
+  return { periods: scanPeriods, fields: scanFields };
+}
+
+// YoY growth % between last two values
+function yoy(arr) {
+  if (!arr || arr.length < 2) return null;
+  const prev = arr[arr.length - 2], curr = arr[arr.length - 1];
+  if (!prev || !curr) return null;
+  return ((curr - prev) / Math.abs(prev)) * 100;
+}
+
+// Valuation engine
+function calcDCF(fcf, g, wacc, tg) {
+  if (!fcf || wacc <= tg) return null;
+  let npv = 0;
+  for (let i = 1; i <= 5; i++) npv += (fcf * Math.pow(1 + g, i)) / Math.pow(1 + wacc, i);
+  const tv = (fcf * Math.pow(1 + g, 5) * (1 + tg)) / (wacc - tg);
+  return npv + tv / Math.pow(1 + wacc, 5);
+}
+
+function calcValuation(fields, opts) {
+  const rev    = fields.revenue?.at(-1)    || 0;
+  const ebitda = fields.ebitda?.at(-1)     || 0;
+  const np     = fields.netProfit?.at(-1)  || 0;
+  const fcf    = fields.cashFlow?.at(-1)   || 0;
+  const dcf    = calcDCF(fcf, opts.growthRate, opts.wacc, opts.terminalGrowth);
+  return {
+    dcf:       dcf,
+    pe:        np   * opts.peMultiple,
+    evEbitda:  ebitda * opts.evMultiple,
+    revMult:   rev  * opts.revMultiple,
+  };
+}
+
+function calcRisk(fields) {
+  const safe = (k) => fields[k]?.at(-1) || 0;
+  const ta   = safe("totalAssets")   || 1;
+  const ca   = safe("currentAssets");
+  const cl   = safe("currentLiab")   || 1;
+  const inv  = safe("inventory");
+  const eq   = safe("equity")        || 1;
+  const tl   = safe("totalLiab");
+  const np   = safe("netProfit");
+  const rev  = safe("revenue")       || 1;
+  const ebit = safe("ebitda");
+  const wc   = ca - cl;
+  const z    = 0.717 * (wc / ta) + 0.847 * (np / ta) + 3.107 * (ebit / ta) + 0.420 * (eq / (tl || 1)) + 0.998 * (rev / ta);
+  return {
+    de:  tl  / eq,
+    cr:  ca  / cl,
+    qr:  (ca - inv) / cl,
+    npm: (np / rev) * 100,
+    z:   isFinite(z) ? z : null,
+  };
+}
+
+// Chart.js canvas hook
+function useChart(ref, config, deps) {
+  useEffect(() => {
+    if (!ref.current) return;
+    const existing = Chart.getChart(ref.current);
+    if (existing) existing.destroy();
+    if (!config) return;
+    new Chart(ref.current, config);
+  }, deps); // eslint-disable-line react-hooks/exhaustive-deps
+}
+
+const CHART_DEFAULTS = {
+  plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => " " + fmtCurrency(ctx.parsed.y) } } },
+  scales: {
+    x: { grid: { color: "rgba(255,255,255,0.04)" }, ticks: { color: "#7a90a8", font: { size: 10 } } },
+    y: { grid: { color: "rgba(255,255,255,0.04)" }, ticks: { color: "#7a90a8", font: { size: 10 } } },
+  },
+  responsive: true, maintainAspectRatio: false,
+};
+
+// ── FinancialAnalystPanel ──────────────────────────────────────────────────────
+function FinancialAnalystPanel({
+  workbooks, setWorkbooks, activeWb, setActiveWb,
+  activeSheet, setActiveSheet, messages, setMessages,
+  input, setInput, streaming, setStreaming,
+  loading, setLoading, streamRef, bufRef, activeModelId,
+}) {
+  // Valuation multiplier inputs
+  const [valOpts, setValOpts] = useState({ growthRate: 0.1, wacc: 0.12, terminalGrowth: 0.02, peMultiple: 15, evMultiple: 10, revMultiple: 2 });
+  const chatBottomRef = useRef(null);
+  const finInputRef   = useRef(null);
+
+  // Chart canvas refs
+  const revChartRef    = useRef(null);
+  const marginChartRef = useRef(null);
+  const cfChartRef     = useRef(null);
+
+  // Active workbook & sheet data
+  const wb    = workbooks.find(w => w.file === activeWb) || workbooks[0];
+  const sheet = wb?.sheets?.find(s => s.name === activeSheet) || wb?.sheets?.[0];
+  const finData = sheet ? detectFinancialRows(sheet.rows) : { periods: [], fields: {} };
+  const { periods, fields } = finData;
+  const hasFinData = Object.keys(fields).length >= 2;
+
+  // Valuation & risk
+  const valuation = hasFinData ? calcValuation(fields, valOpts) : null;
+  const risk      = hasFinData ? calcRisk(fields) : null;
+
+  // Scroll chat to bottom
+  useEffect(() => { chatBottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+
+  // Set defaults when workbooks change
+  useEffect(() => {
+    if (workbooks.length > 0 && !activeWb) {
+      setActiveWb(workbooks[0].file);
+      setActiveSheet(workbooks[0].sheets?.[0]?.name || null);
+    }
+  }, [workbooks]); // eslint-disable-line
+
+  // Revenue trend chart
+  useChart(revChartRef, periods.length && fields.revenue ? {
+    type: "line",
+    data: {
+      labels: periods,
+      datasets: [{ data: fields.revenue, borderColor: "#3b82f6", backgroundColor: "rgba(59,130,246,0.12)", fill: true, tension: 0.4, pointRadius: 4, pointBackgroundColor: "#3b82f6" }],
+    },
+    options: { ...CHART_DEFAULTS, plugins: { ...CHART_DEFAULTS.plugins, tooltip: { callbacks: { label: ctx => " " + fmtCurrency(ctx.parsed.y) } } } },
+  } : null, [periods.join(), JSON.stringify(fields.revenue)]);
+
+  // Profit margin chart
+  const marginData = periods.map((_, i) => {
+    const r = fields.revenue?.[i], p = fields.netProfit?.[i];
+    return (r && p) ? (p / r * 100) : null;
+  });
+  useChart(marginChartRef, periods.length && marginData.some(v => v !== null) ? {
+    type: "bar",
+    data: {
+      labels: periods,
+      datasets: [{ data: marginData, backgroundColor: marginData.map(v => v >= 0 ? "rgba(34,197,94,0.7)" : "rgba(239,68,68,0.7)"), borderRadius: 4 }],
+    },
+    options: { ...CHART_DEFAULTS, plugins: { ...CHART_DEFAULTS.plugins, tooltip: { callbacks: { label: ctx => " " + (ctx.parsed.y?.toFixed(1) || "N/A") + "%" } } } },
+  } : null, [periods.join(), JSON.stringify(fields.netProfit), JSON.stringify(fields.revenue)]);
+
+  // Cash flow chart
+  useChart(cfChartRef, periods.length && fields.cashFlow ? {
+    type: "bar",
+    data: {
+      labels: periods,
+      datasets: [{ data: fields.cashFlow, backgroundColor: fields.cashFlow.map(v => (v || 0) >= 0 ? "rgba(56,189,248,0.7)" : "rgba(239,68,68,0.7)"), borderRadius: 4 }],
+    },
+    options: { ...CHART_DEFAULTS },
+  } : null, [periods.join(), JSON.stringify(fields.cashFlow)]);
+
+  // Link workbook(s)
+  async function linkWorkbooks() {
+    setLoading(true);
+    try {
+      const paths = await open({ multiple: true, filters: [{ name: "Excel Workbook", extensions: ["xlsx", "xls", "xlsm"] }] });
+      if (!paths) return;
+      const pathArr = Array.isArray(paths) ? paths : [paths];
+      // Filter already-loaded paths
+      const existing = new Set(workbooks.map(w => w.path));
+      const newPaths = pathArr.filter(p => !existing.has(p));
+      if (!newPaths.length) return;
+      const result = await invoke("read_excel_multi", { paths: newPaths });
+      const newWbs = result.workbooks || [];
+      setWorkbooks(prev => {
+        const merged = [...prev, ...newWbs];
+        if (!activeWb && merged.length > 0) {
+          setActiveWb(merged[0].file);
+          setActiveSheet(merged[0].sheets?.[0]?.name || null);
+        }
+        return merged;
+      });
+    } catch (e) {
+      console.error("[finance] link workbooks:", e);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function removeWorkbook(file) {
+    setWorkbooks(prev => {
+      const next = prev.filter(w => w.file !== file);
+      if (activeWb === file) {
+        setActiveWb(next[0]?.file || null);
+        setActiveSheet(next[0]?.sheets?.[0]?.name || null);
+      }
+      return next;
+    });
+  }
+
+  // Build AI context from ALL linked workbooks (compact but complete)
+  function buildFinContext() {
+    return workbooks.map(w =>
+      `=== Workbook: ${w.file} ===\n` +
+      w.sheets.map(sh => {
+        // Send full sheet data (all rows, all columns), truncated to 300 rows per sheet
+        const dataRows = sh.rows.slice(0, 300);
+        const formatted = dataRows.map(row =>
+          row.map(v => v === null || v === undefined ? "" : String(v)).join(" | ")
+        ).join("\n");
+        return `--- Sheet: ${sh.name} ---\n${formatted}`;
+      }).join("\n")
+    ).join("\n\n");
+  }
+
+  // Send AI message
+  async function sendFinMsg() {
+    const text = input.trim();
+    if (!text || !activeModelId || streaming) return;
+    const userMsg = { id: Date.now(), role: "user", text };
+    const aiId   = Date.now() + 1;
+    const aiMsg  = { id: aiId, role: "ai", text: "", streaming: true };
+    setMessages(prev => [...prev, userMsg, aiMsg]);
+    setInput("");
+    setStreaming(true);
+    streamRef.current = aiId;
+    bufRef.current    = "";
+
+    const ctx     = buildFinContext();
+    const history = messages.slice(-6).map(m => `${m.role === "user" ? "User" : "AI"}: ${m.text}`).join("\n");
+    const prompt  = `You are an expert financial analyst. Analyse the workbook data provided and answer the question accurately. Show calculations when relevant.\n\nWORKBOOK DATA:\n${ctx}\n\nCONVERSATION HISTORY:\n${history}\n\nUser: ${text}\nAI:`;
+
+    const unlisten = await listen("llm-token", e => {
+      if (streamRef.current !== aiId) return;
+      bufRef.current += e.payload;
+      setMessages(prev => prev.map(m => m.id === aiId ? { ...m, text: bufRef.current } : m));
+    });
+    const unlistenDone = await listen("llm-done", () => {
+      setMessages(prev => prev.map(m => m.id === aiId ? { ...m, streaming: false } : m));
+      setStreaming(false);
+      streamRef.current = null;
+      unlisten(); unlistenDone();
+    });
+
+    try {
+      await invoke("generate", { prompt, maxTokens: 2048, temperature: 0.3 });
+    } catch (e) {
+      setMessages(prev => prev.map(m => m.id === aiId ? { ...m, text: "Error: " + e, streaming: false } : m));
+      setStreaming(false);
+      unlisten(); unlistenDone();
+    }
+  }
+
+  // Risk badge helper
+  function riskBadge(val, thresholds, inverted = false) {
+    if (val === null || isNaN(val)) return { color: C.t3, label: "N/A", icon: "—" };
+    const [green, amber] = inverted ? [thresholds[1], thresholds[0]] : thresholds;
+    if (!inverted ? val >= green : val <= green) return { color: C.green, label: "Healthy", icon: "✅" };
+    if (!inverted ? val >= amber : val <= amber) return { color: C.amber, label: "Warning", icon: "⚠️" };
+    return { color: C.red, label: "Risk", icon: "❌" };
+  }
+
+  const KPI_DEFS = [
+    { key: "revenue",    label: "Revenue",      color: C.blue  },
+    { key: "netProfit",  label: "Net Profit",   color: C.green },
+    { key: "ebitda",     label: "EBITDA",       color: C.cyan  },
+    { key: "cashFlow",   label: "Cash Flow",    color: C.amber },
+    { key: "grossProfit",label: "Gross Profit", color: C.purple},
+  ].filter(d => fields[d.key]);
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: C.bgDeep }}>
+      {/* ── Header ── */}
+      <div style={{ padding: "12px 20px", borderBottom: `1px solid ${C.border}`, background: C.bgPanel, display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
+        <Icon d={IC.chart} size={16} stroke={C.green} />
+        <span style={{ fontSize: 14, fontWeight: 700, color: C.t1 }}>Financial Analyst</span>
+        {workbooks.length > 0 && <span style={{ fontSize: 11, color: C.t3 }}>{workbooks.length} workbook{workbooks.length > 1 ? "s" : ""} linked</span>}
+        <div style={{ flex: 1 }} />
+        {/* Workbook tabs */}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxWidth: "60%" }}>
+          {workbooks.map(w => (
+            <div key={w.file} onClick={() => { setActiveWb(w.file); setActiveSheet(w.sheets?.[0]?.name || null); }}
+              style={{ display: "flex", alignItems: "center", gap: 5, padding: "3px 10px 3px 10px", borderRadius: 20, cursor: "pointer",
+                background: activeWb === w.file ? "rgba(34,197,94,0.15)" : C.bgCard,
+                border: `1px solid ${activeWb === w.file ? C.green : C.border}`,
+                color: activeWb === w.file ? C.green : C.t2, fontSize: 11, fontWeight: 500 }}>
+              📊 {w.file}
+              <span onClick={e => { e.stopPropagation(); removeWorkbook(w.file); }}
+                style={{ marginLeft: 2, color: C.t3, cursor: "pointer", fontSize: 10 }}>✕</span>
+            </div>
+          ))}
+        </div>
+        <Btn onClick={linkWorkbooks} disabled={loading} style={{
+          padding: "6px 14px", background: C.green, border: "none", borderRadius: 8,
+          color: "#fff", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+          {loading ? <Spinner /> : <Icon d={IC.plus} size={12} />}
+          {loading ? "Loading…" : "Link Workbook"}
+        </Btn>
+      </div>
+
+      {/* ── Sheet selector ── */}
+      {wb && wb.sheets.length > 1 && (
+        <div style={{ padding: "6px 20px", borderBottom: `1px solid ${C.border}`, background: C.bgPanel, display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {wb.sheets.map(sh => (
+            <Btn key={sh.name} onClick={() => setActiveSheet(sh.name)} style={{
+              padding: "3px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500,
+              background: activeSheet === sh.name ? "rgba(59,130,246,0.15)" : C.bgCard,
+              border: `1px solid ${activeSheet === sh.name ? C.blue : C.border}`,
+              color: activeSheet === sh.name ? C.blue : C.t2 }}>
+              {sh.name}
+            </Btn>
+          ))}
+        </div>
+      )}
+
+      {/* ── No workbooks empty state ── */}
+      {workbooks.length === 0 && (
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16 }}>
+          <div style={{ fontSize: 48 }}>📊</div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: C.t1 }}>Financial Analyst</div>
+          <div style={{ fontSize: 13, color: C.t2, textAlign: "center", maxWidth: 400 }}>
+            Link one or more Excel workbooks (P&L, Balance Sheet, Cash Flow) to get started.<br/>
+            The AI will analyse your data and provide valuation, risk metrics, and insights.
+          </div>
+          <Btn onClick={linkWorkbooks} disabled={loading} style={{
+            padding: "10px 24px", background: C.green, border: "none", borderRadius: 10,
+            color: "#fff", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
+            {loading ? <Spinner /> : <Icon d={IC.plus} size={14} />}
+            {loading ? "Loading…" : "Link Workbook"}
+          </Btn>
+        </div>
+      )}
+
+      {/* ── Main two-column layout ── */}
+      {workbooks.length > 0 && (
+        <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+
+          {/* LEFT — Dashboard (60%) */}
+          <div style={{ flex: "0 0 60%", overflowY: "auto", padding: "16px 20px", borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", gap: 16 }}>
+
+            {/* No financial data detected */}
+            {!hasFinData && (
+              <div style={{ padding: 20, background: "rgba(245,158,11,0.08)", border: `1px solid rgba(245,158,11,0.25)`, borderRadius: 12, display: "flex", gap: 12 }}>
+                <Icon d={IC.warning} size={18} stroke={C.amber} />
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: C.amber }}>No financial fields detected</div>
+                  <div style={{ fontSize: 12, color: C.t2, marginTop: 4 }}>
+                    The selected sheet doesn't have recognisable financial labels (Revenue, EBITDA, Net Profit, etc.).
+                    Try a different sheet, or use the AI chat to ask questions about your data.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Raw data preview (always shown) */}
+            {sheet && (
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: C.t3, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
+                  Sheet Preview — {sheet.name} ({sheet.rows.length} rows × {Math.max(...sheet.rows.map(r => r.length), 0)} cols)
+                </div>
+                <div style={{ overflowX: "auto", borderRadius: 10, border: `1px solid ${C.border}` }}>
+                  <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11 }}>
+                    <tbody>
+                      {sheet.rows.slice(0, 10).map((row, ri) => (
+                        <tr key={ri} style={{ background: ri === 0 ? C.bgCard : "transparent", borderBottom: `1px solid ${C.border}` }}>
+                          {row.slice(0, 10).map((cell, ci) => (
+                            <td key={ci} style={{ padding: "5px 10px", color: ri === 0 ? C.t1 : C.t2, fontWeight: ri === 0 ? 600 : 400, whiteSpace: "nowrap", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis" }}>
+                              {cell === null || cell === undefined ? "" : String(cell)}
+                            </td>
+                          ))}
+                          {row.length > 10 && <td style={{ padding: "5px 10px", color: C.t3, fontSize: 10 }}>+{row.length - 10} more</td>}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {sheet.rows.length > 10 && <div style={{ padding: "6px 10px", fontSize: 10, color: C.t3 }}>Showing first 10 of {sheet.rows.length} rows</div>}
+                </div>
+              </div>
+            )}
+
+            {hasFinData && <>
+
+              {/* KPI Cards */}
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: C.t3, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Key Metrics — {periods.at(-1) || "Latest"}</div>
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  {KPI_DEFS.map(({ key, label, color }) => {
+                    const vals = fields[key];
+                    const latest = vals?.at(-1);
+                    const growth = yoy(vals);
+                    return (
+                      <div key={key} style={{ flex: "1 1 130px", padding: "12px 14px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12, minWidth: 120 }}>
+                        <div style={{ fontSize: 10, color: C.t3, marginBottom: 4 }}>{label}</div>
+                        <div style={{ fontSize: 18, fontWeight: 700, color, marginBottom: 3 }}>{fmtCurrency(latest)}</div>
+                        {growth !== null && (
+                          <div style={{ fontSize: 10, color: growth >= 0 ? C.green : C.red }}>
+                            {growth >= 0 ? "▲" : "▼"} {Math.abs(growth).toFixed(1)}% YoY
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Charts row */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                {/* Revenue Trend */}
+                {fields.revenue && (
+                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>📈 Revenue Trend</div>
+                    <div style={{ height: 140, position: "relative" }}><canvas ref={revChartRef} /></div>
+                  </div>
+                )}
+                {/* Profit Margin */}
+                {fields.netProfit && fields.revenue && (
+                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>💹 Net Profit Margin %</div>
+                    <div style={{ height: 140, position: "relative" }}><canvas ref={marginChartRef} /></div>
+                  </div>
+                )}
+                {/* Cash Flow */}
+                {fields.cashFlow && (
+                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>💰 Cash Flow</div>
+                    <div style={{ height: 140, position: "relative" }}><canvas ref={cfChartRef} /></div>
+                  </div>
+                )}
+                {/* EBITDA Bar */}
+                {fields.ebitda && (
+                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>📊 EBITDA</div>
+                    <div style={{ height: 140, position: "relative" }}>
+                      <_EbitdaChart periods={periods} data={fields.ebitda} />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Valuation + Risk side by side */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+
+                {/* Valuation */}
+                <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.cyan, marginBottom: 10 }}>🏷️ Valuation Estimates</div>
+                  {[
+                    { label: "DCF Valuation",     val: valuation?.dcf,      color: C.blue },
+                    { label: `P/E × ${valOpts.peMultiple}`,    val: valuation?.pe,       color: C.green },
+                    { label: `EV/EBITDA × ${valOpts.evMultiple}`, val: valuation?.evEbitda, color: C.cyan },
+                    { label: `Rev × ${valOpts.revMultiple}x`,     val: valuation?.revMult,  color: C.purple },
+                  ].map(({ label, val, color }) => (
+                    <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <span style={{ fontSize: 11, color: C.t2 }}>{label}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color }}>{fmtCurrency(val)}</span>
+                    </div>
+                  ))}
+                  {/* Multiplier inputs */}
+                  <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 8, paddingTop: 8 }}>
+                    <div style={{ fontSize: 10, color: C.t3, marginBottom: 6 }}>Adjust multiples:</div>
+                    {[
+                      { label: "Growth %", key: "growthRate",      factor: 100, suffix: "%" },
+                      { label: "WACC %",   key: "wacc",            factor: 100, suffix: "%" },
+                      { label: "P/E",      key: "peMultiple",      factor: 1,   suffix: "×" },
+                      { label: "EV/EBITDA",key: "evMultiple",      factor: 1,   suffix: "×" },
+                    ].map(({ label, key, factor, suffix }) => (
+                      <div key={key} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                        <span style={{ fontSize: 10, color: C.t2, width: 70 }}>{label}</span>
+                        <input type="number" value={(valOpts[key] * factor).toFixed(factor === 100 ? 1 : 0)}
+                          onChange={e => setValOpts(o => ({ ...o, [key]: parseFloat(e.target.value || 0) / factor }))}
+                          style={{ width: 60, background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 5, color: C.t1, fontSize: 11, padding: "2px 6px" }} />
+                        <span style={{ fontSize: 10, color: C.t3 }}>{suffix}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Risk Analysis */}
+                <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.red, marginBottom: 10 }}>⚠️ Risk Analysis</div>
+                  {[
+                    { label: "Debt / Equity",     val: risk?.de,  fmt: v => v?.toFixed(2), thresh: [1.0, 2.0], inv: true },
+                    { label: "Current Ratio",     val: risk?.cr,  fmt: v => v?.toFixed(2), thresh: [1.5, 1.0], inv: false },
+                    { label: "Quick Ratio",       val: risk?.qr,  fmt: v => v?.toFixed(2), thresh: [1.0, 0.7], inv: false },
+                    { label: "Net Profit Margin", val: risk?.npm, fmt: v => v?.toFixed(1) + "%", thresh: [10, 5], inv: false },
+                    { label: "Altman Z-Score",    val: risk?.z,   fmt: v => v?.toFixed(2), thresh: [2.99, 1.81], inv: false },
+                  ].map(({ label, val, fmt, thresh, inv }) => {
+                    const badge = riskBadge(val, thresh, inv);
+                    return (
+                      <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 9 }}>
+                        <span style={{ fontSize: 11, color: C.t2 }}>{label}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ fontSize: 12, fontWeight: 700, color: badge.color }}>{val !== null && !isNaN(val) ? fmt(val) : "N/A"}</span>
+                          <span style={{ fontSize: 12 }}>{badge.icon}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div style={{ marginTop: 8, padding: "8px", background: C.bgPanel, borderRadius: 8, fontSize: 10, color: C.t3 }}>
+                    Z &gt; 2.99 safe · 1.81–2.99 grey zone · &lt; 1.81 distress
+                  </div>
+                </div>
+
+              </div>
+
+              {/* Multi-period comparison table */}
+              {periods.length > 1 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: C.t3, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Period Comparison</div>
+                  <div style={{ overflowX: "auto", borderRadius: 10, border: `1px solid ${C.border}` }}>
+                    <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11 }}>
+                      <thead>
+                        <tr style={{ background: C.bgCard }}>
+                          <th style={{ padding: "7px 12px", textAlign: "left", color: C.t2, fontWeight: 600 }}>Metric</th>
+                          {periods.map(p => <th key={p} style={{ padding: "7px 12px", textAlign: "right", color: C.t2, fontWeight: 600 }}>{p}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(fields).map(([key, vals]) => (
+                          <tr key={key} style={{ borderTop: `1px solid ${C.border}` }}>
+                            <td style={{ padding: "6px 12px", color: C.t1, fontWeight: 500 }}>{key.replace(/([A-Z])/g, " $1").trim()}</td>
+                            {periods.map((_, i) => (
+                              <td key={i} style={{ padding: "6px 12px", textAlign: "right", color: C.cyan }}>{fmtCurrency(vals[i])}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+            </>}
+          </div>
+
+          {/* RIGHT — AI Chat (40%) */}
+          <div style={{ flex: "0 0 40%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "10px 16px", borderBottom: `1px solid ${C.border}`, background: C.bgPanel }}>
+              <span style={{ fontSize: 12, fontWeight: 600, color: C.t1 }}>🤖 AI Financial Analyst</span>
+              <div style={{ fontSize: 10, color: C.t3, marginTop: 2 }}>Ask questions about your workbook data</div>
+            </div>
+
+            {/* Messages */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+              {messages.length === 0 && (
+                <div style={{ textAlign: "center", paddingTop: 30 }}>
+                  <div style={{ fontSize: 28, marginBottom: 8 }}>💬</div>
+                  <div style={{ fontSize: 12, color: C.t3 }}>
+                    {workbooks.length === 0
+                      ? "Link a workbook first, then ask me anything about your financial data."
+                      : "Ask me anything about your financial data.\n\nTry: \"What was our revenue growth?\", \"Calculate valuation\", \"Identify risks\""}
+                  </div>
+                  {/* Quick starter prompts */}
+                  {workbooks.length > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center", marginTop: 14 }}>
+                      {["Summarise financial performance", "What are the key risks?", "Calculate EBITDA margin trend", "Compare periods"].map(p => (
+                        <Btn key={p} onClick={() => { setInput(p); finInputRef.current?.focus(); }}
+                          style={{ padding: "5px 11px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 20, color: C.t2, fontSize: 10.5 }}>
+                          {p}
+                        </Btn>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {messages.map(msg => (
+                <div key={msg.id} style={{
+                  padding: "9px 12px",
+                  background: msg.role === "user" ? C.bgCard : "rgba(34,197,94,0.06)",
+                  border: `1px solid ${msg.role === "user" ? C.border : "rgba(34,197,94,0.2)"}`,
+                  borderRadius: msg.role === "user" ? "14px 4px 14px 14px" : "4px 14px 14px 14px",
+                  alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
+                  maxWidth: "90%", fontSize: 12.5, color: C.t2, lineHeight: 1.65,
+                  whiteSpace: "pre-wrap", wordBreak: "break-word",
+                }}>
+                  {msg.text || (msg.streaming ? <Typing /> : "")}
+                </div>
+              ))}
+              <div ref={chatBottomRef} />
+            </div>
+
+            {/* Input */}
+            <div style={{ padding: "10px 14px 14px", background: C.bgPanel, borderTop: `1px solid ${C.border}` }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-end", padding: "8px 12px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
+                <textarea
+                  ref={finInputRef}
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFinMsg(); } }}
+                  placeholder={activeModelId ? "Ask about your financial data…" : "Load a model first to chat"}
+                  rows={1}
+                  style={{ flex: 1, background: "none", border: "none", color: C.t1, fontSize: 12.5, lineHeight: 1.6, maxHeight: 100, overflowY: "auto", fontFamily: "inherit", resize: "none" }}
+                />
+                <Btn onClick={sendFinMsg} disabled={!input.trim() || !activeModelId || streaming} style={{
+                  width: 32, height: 32, borderRadius: 8, border: "none", flexShrink: 0,
+                  background: input.trim() && activeModelId ? C.green : C.bgPanel,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  color: input.trim() && activeModelId ? "#fff" : C.t3 }}>
+                  <Icon d={IC.send} size={13} />
+                </Btn>
+              </div>
+              <div style={{ marginTop: 5, fontSize: 10, color: C.t3, textAlign: "center" }}>
+                All {workbooks.length > 0 ? workbooks.reduce((a, w) => a + w.sheets.length, 0) + " sheets from " + workbooks.length + " workbook(s)" : "workbook data"} sent as context
+              </div>
+            </div>
+          </div>
+
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Standalone EBITDA chart (separate ref to avoid collisions)
+function _EbitdaChart({ periods, data }) {
+  const ref = useRef(null);
+  useChart(ref, periods.length && data ? {
+    type: "bar",
+    data: {
+      labels: periods,
+      datasets: [{ data, backgroundColor: "rgba(168,85,247,0.7)", borderRadius: 4 }],
+    },
+    options: { ...CHART_DEFAULTS },
+  } : null, [periods.join(), JSON.stringify(data)]);
+  return <canvas ref={ref} />;
+}
+
 // ─── Template Panel Component ─────────────────────────────────────────────────
 function TemplatePanel({ onSelect, onClose }) {
   const [activeCategory, setActiveCategory] = useState("education");
@@ -2404,6 +3152,17 @@ function OfflineAIApp() {
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  // ── Financial Analyst state ──────────────────────────────────────────────
+  const [showFinance, setShowFinance]         = useState(false);
+  const [finWorkbooks, setFinWorkbooks]       = useState([]); // { file, path, sheets[] }[]
+  const [finActiveWb, setFinActiveWb]         = useState(null);
+  const [finActiveSheet, setFinActiveSheet]   = useState(null);
+  const [finMessages, setFinMessages]         = useState([]);
+  const [finInput, setFinInput]               = useState("");
+  const [finStreaming, setFinStreaming]        = useState(false);
+  const [finLoading, setFinLoading]           = useState(false);
+  const finStreamRef                          = useRef(null); // active stream msg id
+  const finBufRef                             = useRef("");   // streaming buffer
   const [showConn, setShowConn] = useState(false);
   const [showMod, setShowMod] = useState(false);
   const [connectors, setConnectors] = useState([]);
@@ -3088,9 +3847,23 @@ function OfflineAIApp() {
             </Btn>
           ))}
 
+          {/* Financial Analyst button */}
+          <Btn onClick={() => { setShowFinance(f => !f); setShowHub(false); }} style={{
+            width: "100%", padding: "9px 10px", borderRadius: 8, border: "none", textAlign: "left",
+            background: showFinance ? "rgba(34,197,94,0.12)" : "transparent",
+            color: showFinance ? C.green : C.t2, fontSize: 12.5, display: "flex", alignItems: "center", gap: 8,
+          }}>
+            <Icon d={IC.chart} size={14} stroke={showFinance ? C.green : C.t3} />
+            Finance
+            <span style={{ marginLeft: "auto", fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 10,
+              background: "rgba(34,197,94,0.15)", color: C.green, border: "1px solid rgba(34,197,94,0.3)" }}>
+              NEW
+            </span>
+          </Btn>
+
           {/* Extension Hub button — desktop only */}
           {isDesktop && (
-            <Btn onClick={() => setShowHub(h => !h)} style={{
+            <Btn onClick={() => { setShowHub(h => !h); setShowFinance(false); }} style={{
               width: "100%", padding: "9px 10px", borderRadius: 8, border: "none", textAlign: "left",
               background: showHub ? "rgba(168,85,247,0.12)" : "transparent",
               color: showHub ? C.purple : C.t2, fontSize: 12.5, display: "flex", alignItems: "center", gap: 8,
@@ -3230,8 +4003,20 @@ function OfflineAIApp() {
           </div>
         )}
 
-        {/* ── Hub Panel (replaces chat when showHub is true) ── */}
-        {showHub ? (
+        {/* ── Financial Analyst Panel ── */}
+        {showFinance ? (
+          <FinancialAnalystPanel
+            workbooks={finWorkbooks}       setWorkbooks={setFinWorkbooks}
+            activeWb={finActiveWb}         setActiveWb={setFinActiveWb}
+            activeSheet={finActiveSheet}   setActiveSheet={setFinActiveSheet}
+            messages={finMessages}         setMessages={setFinMessages}
+            input={finInput}               setInput={setFinInput}
+            streaming={finStreaming}        setStreaming={setFinStreaming}
+            loading={finLoading}           setLoading={setFinLoading}
+            streamRef={finStreamRef}       bufRef={finBufRef}
+            activeModelId={activeModelId}
+          />
+        ) : showHub ? (
           <HubPanel
             hubClients={hubClients}
             activeHubId={activeHubId}

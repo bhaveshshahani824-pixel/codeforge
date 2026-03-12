@@ -364,6 +364,74 @@ fn read_excel_sheets(path: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "sheets": sheets }))
 }
 
+// ── Read multiple Excel workbooks (Financial Analyst) ────────────────────────
+#[tauri::command]
+fn read_excel_multi(paths: Vec<String>) -> Result<serde_json::Value, String> {
+    use calamine::{open_workbook_auto, Reader, Data};
+
+    let mut workbooks_out = Vec::new();
+
+    for path in &paths {
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let mut workbook = open_workbook_auto(path)
+            .map_err(|e| format!("Cannot open '{}': {}", filename, e))?;
+
+        let sheet_names = workbook.sheet_names().to_vec();
+        let mut sheets = Vec::new();
+
+        for name in &sheet_names {
+            if let Ok(range) = workbook.worksheet_range(name) {
+                // Preserve raw numeric values (not formatted strings) so the
+                // frontend can do precise calculations (valuation, ratios, etc.)
+                let rows: Vec<Vec<serde_json::Value>> = range
+                    .rows()
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| match cell {
+                                Data::Empty        => serde_json::Value::Null,
+                                Data::String(s)    => serde_json::json!(s),
+                                Data::Float(f)     => {
+                                    // Return integer JSON number when there's no fraction
+                                    if f.fract() == 0.0 && f.abs() < 1e15 {
+                                        serde_json::json!(*f as i64)
+                                    } else {
+                                        serde_json::json!(f)
+                                    }
+                                }
+                                Data::Int(i)       => serde_json::json!(i),
+                                Data::Bool(b)      => serde_json::json!(b),
+                                Data::DateTime(d)  => serde_json::json!(format!("{:.5}", d)),
+                                Data::DateTimeIso(s) => serde_json::json!(s),
+                                Data::DurationIso(s) => serde_json::json!(s),
+                                Data::Error(e)     => serde_json::json!(format!("#{:?}", e)),
+                            })
+                            .collect()
+                    })
+                    // Keep a row only if at least one cell is non-null
+                    .filter(|row: &Vec<serde_json::Value>| row.iter().any(|v| !v.is_null()))
+                    .collect();
+
+                if !rows.is_empty() {
+                    sheets.push(serde_json::json!({ "name": name, "rows": rows }));
+                }
+            }
+        }
+
+        workbooks_out.push(serde_json::json!({
+            "file": filename,
+            "path": path,
+            "sheets": sheets,
+        }));
+    }
+
+    Ok(serde_json::json!({ "workbooks": workbooks_out }))
+}
+
 // ── Model loading / inference ─────────────────────────────────────────────────
 
 #[tauri::command]
@@ -902,6 +970,7 @@ pub fn run() {
             reset_server,
             stop_generate,
             read_excel_sheets,
+            read_excel_multi,
             load_model,
             unload_model,
             generate,
