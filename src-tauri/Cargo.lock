@@ -2279,7 +2279,10 @@ dependencies = [
  "calamine",
  "futures-util",
  "pdf-extract",
+ "rand 0.8.5",
+ "regex",
  "reqwest 0.12.28",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "tauri",
@@ -3138,6 +3141,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.78.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21f14f6d77c0b3a1004a4bb84be3993c65c58145e58600d2c6a2955295b7d9c9"
+dependencies = [
+ "zip 2.4.2",
 ]
 
 [[package]]

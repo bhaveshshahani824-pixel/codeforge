@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [{ "title": "Codeforge AI", "width": 1280, "height": 820, "minWidth": 900, "minHeight": 600, "resizable": true }],
     "security": { "csp": null }
   },

@@ -1,2 +1,86 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { overflow: hidden; }
+textarea { resize: none; outline: none; }
+button { outline: none; border: none; }
+input { outline: none; }
+
+/* ── Responsive layout ── */
+.app-layout   { display: flex; flex-direction: row; height: 100vh; width: 100vw; overflow: hidden; }
+.sidebar      { width: 240px; flex-shrink: 0; display: flex; flex-direction: column; overflow: hidden; }
+.main-area    { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.sidebar-chat-list { flex: 1; overflow-y: auto; }
+
+/* Message bubble max-width on desktop */
+.message-bubble { max-width: 80%; }
+
+/* ── Mobile (≤768px) ── */
+@media (max-width: 768px) {
+  /* Whole layout becomes column: main-area on top, sidebar (bottom nav) at bottom */
+  .app-layout {
+    flex-direction: column !important;
+  }
+
+  /* Sidebar → fixed bottom tab bar */
+  .sidebar {
+    order: 2;
+    width: 100% !important;
+    /* Account for phone home bar */
+    height: calc(58px + env(safe-area-inset-bottom, 0px)) !important;
+    min-height: calc(58px + env(safe-area-inset-bottom, 0px)) !important;
+    flex-direction: row !important;
+    align-items: flex-start !important;
+    justify-content: space-around !important;
+    border-right: none !important;
+    border-top: 1px solid rgba(255,255,255,0.09) !important;
+    padding: 0 !important;
+    padding-bottom: env(safe-area-inset-bottom, 0px) !important;
+    overflow: hidden !important;
+    gap: 0 !important;
+    flex-shrink: 0 !important;
+  }
+
+  /* Main area fills the rest above bottom nav */
+  .main-area {
+    order: 1;
+    height: calc(100vh - 58px - env(safe-area-inset-bottom, 0px)) !important;
+    max-height: calc(100vh - 58px - env(safe-area-inset-bottom, 0px)) !important;
+    flex: 1 !important;
+    overflow: hidden !important;
+  }
+
+  /* Hide desktop-only sidebar sections */
+  .sidebar-chat-list { display: none !important; }
+  .sidebar-search    { display: none !important; }
+  .sidebar-header    { display: none !important; }
+  .sidebar-qr        { display: none !important; }
+
+  /* Message bubbles use more width */
+  .message-bubble { max-width: 88% !important; }
+
+  /* Mobile tab buttons — full height, no extra min-height forcing */
+  .mobile-tab-btn {
+    flex: 1;
+    height: 58px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 8px 4px 6px;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  .mobile-tab-btn span {
+    font-size: 10px;
+    line-height: 1;
+  }
+}
+
+/* ── Tablet (769px–1024px) ── */
+@media (max-width: 1024px) and (min-width: 769px) {
+  .sidebar { width: 200px !important; }
+}

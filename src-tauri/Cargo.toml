@@ -28,6 +28,9 @@ pdf-extract = "0.7"
 # Extension Hub — local WebSocket server for VS Code / Cursor integration (desktop only)
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+rust_xlsxwriter = "0.78"
+regex = "1"
 
 [profile.release]
 panic = "abort"

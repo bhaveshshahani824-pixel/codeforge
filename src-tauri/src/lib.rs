@@ -27,6 +27,7 @@ fn server_exe(app: &AppHandle) -> PathBuf {
 pub struct ServerState {
     process: Mutex<Option<std::process::Child>>,
     stop_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dl_cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl ServerState {
@@ -34,11 +35,41 @@ impl ServerState {
         ServerState {
             process: Mutex::new(None),
             stop_tx: Mutex::new(None),
+            dl_cancel: Mutex::new(None),
         }
     }
 }
 
 const SERVER_PORT: u16 = 8088;
+
+// ── Security Shield state ─────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ShieldEntry {
+    path: String,
+    file_name: String,
+    file_type: String,
+    decoy_path: Option<String>,
+    baseline_mtime: u64,
+    baseline_size: u64,
+    baseline_atime: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ShieldLogEntry {
+    id: u64,
+    timestamp: String,
+    path: String,
+    file_name: String,
+    event: String,
+}
+
+#[derive(Default)]
+struct ShieldState {
+    entries: std::sync::Mutex<std::collections::HashMap<String, ShieldEntry>>,
+    log: std::sync::Mutex<Vec<ShieldLogEntry>>,
+    counter: std::sync::atomic::AtomicU64,
+}
 
 // ── RAM detection ─────────────────────────────────────────────────────────────
 
@@ -123,15 +154,27 @@ fn walk_dir(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>
 #[tauri::command]
 fn delete_model(app: AppHandle, model_id: String) -> Result<(), String> {
     let dir = models_dir(&app).join(&model_id);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    if !dir.exists() {
+        return Ok(());
     }
-    Ok(())
+    // Retry loop: Windows holds file handles briefly after process kill.
+    let mut last_err = String::new();
+    for attempt in 0..6 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(format!("Could not delete model files (file may still be in use): {}", last_err))
 }
 
 #[tauri::command]
 async fn download_file(
     app: AppHandle,
+    state: tauri::State<'_, ServerState>,
     url: String,
     model_id: String,
     file_path: String,
@@ -140,6 +183,13 @@ async fn download_file(
     let dest = models_dir(&app).join(&model_id).join(&file_path);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    // Register a cancel channel so cancel_download can abort this transfer.
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut lock = state.dl_cancel.lock().unwrap();
+        *lock = Some(cancel_tx);
     }
 
     let client = reqwest::Client::new();
@@ -162,8 +212,21 @@ async fn download_file(
     let mut downloaded: u64 = 0;
     let mut last_emit = std::time::Instant::now();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
+    loop {
+        let item = tokio::select! {
+            biased;
+            _ = &mut cancel_rx => {
+                // User cancelled — drop file handle then delete the partial file.
+                drop(file);
+                let _ = tokio::fs::remove_file(&dest).await;
+                return Err("cancelled".to_string());
+            }
+            item = stream.next() => item,
+        };
+        let chunk = match item {
+            Some(c) => c.map_err(|e| e.to_string())?,
+            None => break,
+        };
         file.write_all(&chunk).await.map_err(|e: std::io::Error| e.to_string())?;
         downloaded += chunk.len() as u64;
         if last_emit.elapsed().as_millis() >= 300 || downloaded == total {
@@ -172,6 +235,15 @@ async fn download_file(
             }));
             last_emit = std::time::Instant::now();
         }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_download(state: tauri::State<'_, ServerState>) -> Result<(), String> {
+    let mut lock = state.dl_cancel.lock().unwrap();
+    if let Some(tx) = lock.take() {
+        let _ = tx.send(());
     }
     Ok(())
 }
@@ -364,72 +436,399 @@ fn read_excel_sheets(path: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "sheets": sheets }))
 }
 
-// ── Read multiple Excel workbooks (Financial Analyst) ────────────────────────
+// ── Agent tools ───────────────────────────────────────────────────────────────
+
 #[tauri::command]
-fn read_excel_multi(paths: Vec<String>) -> Result<serde_json::Value, String> {
-    use calamine::{open_workbook_auto, Reader, Data};
-
-    let mut workbooks_out = Vec::new();
-
-    for path in &paths {
-        let filename = std::path::Path::new(path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        let mut workbook = open_workbook_auto(path)
-            .map_err(|e| format!("Cannot open '{}': {}", filename, e))?;
-
-        let sheet_names = workbook.sheet_names().to_vec();
-        let mut sheets = Vec::new();
-
-        for name in &sheet_names {
-            if let Ok(range) = workbook.worksheet_range(name) {
-                // Preserve raw numeric values (not formatted strings) so the
-                // frontend can do precise calculations (valuation, ratios, etc.)
-                let rows: Vec<Vec<serde_json::Value>> = range
-                    .rows()
-                    .map(|row| {
-                        row.iter()
-                            .map(|cell| match cell {
-                                Data::Empty        => serde_json::Value::Null,
-                                Data::String(s)    => serde_json::json!(s),
-                                Data::Float(f)     => {
-                                    // Return integer JSON number when there's no fraction
-                                    if f.fract() == 0.0 && f.abs() < 1e15 {
-                                        serde_json::json!(*f as i64)
-                                    } else {
-                                        serde_json::json!(f)
-                                    }
-                                }
-                                Data::Int(i)       => serde_json::json!(i),
-                                Data::Bool(b)      => serde_json::json!(b),
-                                Data::DateTime(d)  => serde_json::json!(format!("{:.5}", d)),
-                                Data::DateTimeIso(s) => serde_json::json!(s),
-                                Data::DurationIso(s) => serde_json::json!(s),
-                                Data::Error(e)     => serde_json::json!(format!("#{:?}", e)),
-                            })
-                            .collect()
-                    })
-                    // Keep a row only if at least one cell is non-null
-                    .filter(|row: &Vec<serde_json::Value>| row.iter().any(|v| !v.is_null()))
-                    .collect();
-
-                if !rows.is_empty() {
-                    sheets.push(serde_json::json!({ "name": name, "rows": rows }));
-                }
-            }
-        }
-
-        workbooks_out.push(serde_json::json!({
-            "file": filename,
-            "path": path,
-            "sheets": sheets,
+fn list_directory(path: String) -> Result<serde_json::Value, String> {
+    let entries = std::fs::read_dir(&path).map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+    for entry in entries.flatten() {
+        let meta = entry.metadata().ok();
+        items.push(serde_json::json!({
+            "name": entry.file_name().to_string_lossy().to_string(),
+            "is_dir": meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+            "size_kb": meta.as_ref().map(|m| m.len() / 1024).unwrap_or(0)
         }));
     }
+    Ok(serde_json::json!(items))
+}
 
-    Ok(serde_json::json!({ "workbooks": workbooks_out }))
+const ALLOWED_CMDS: &[&str] = &[
+    "dir", "ls", "python", "python3", "git", "node", "npm",
+    "type", "cat", "echo", "whoami", "ipconfig", "ifconfig",
+    "find", "grep", "pwd", "date", "time",
+    // Workflow Autopilot extended allowlist
+    "curl", "wget", "ping", "tracert", "traceroute", "nslookup",
+    "systeminfo", "tasklist", "taskkill", "wmic", "net",
+    "copy", "move", "del", "mkdir", "rmdir", "rename",
+    "powershell", "where", "which",
+    "java", "mvn", "gradle", "pip", "pip3", "cargo", "go",
+    "dotnet", "make", "cmake",
+    "set", "env", "printenv",
+    "head", "tail", "sort", "uniq", "wc",
+    "zip", "unzip", "tar",
+    "ffmpeg", "convert", "magick",
+];
+
+#[tauri::command]
+async fn run_shell_command(command: String) -> Result<serde_json::Value, String> {
+    let cmd_lower = command.trim().to_lowercase();
+    let allowed = ALLOWED_CMDS.iter().any(|a| cmd_lower.starts_with(a));
+    if !allowed {
+        return Err(format!(
+            "Command '{}' not in allowlist. Allowed prefixes: {}",
+            command,
+            ALLOWED_CMDS.join(", ")
+        ));
+    }
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) { vec!["/C", &command] } else { vec!["-c", &command] })
+            .output()
+    }).await.map_err(|e| e.to_string())?.map_err(|e: std::io::Error| e.to_string())?;
+    Ok(serde_json::json!({
+        "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+        "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+        "exit_code": output.status.code().unwrap_or(-1)
+    }))
+}
+
+/// Read a text file from disk (agent tool).
+#[tauri::command]
+fn read_file_text(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("Cannot read '{}': {}", path, e))
+}
+
+// ── Screen capture ────────────────────────────────────────────────────────────
+
+/// Capture the primary monitor and return base64-encoded PNG.
+#[tauri::command]
+async fn take_screenshot() -> Result<String, String> {
+    let tmp_path = std::env::temp_dir().join("offlineai_screen.png");
+    let tmp_str = tmp_path.to_string_lossy().into_owned();
+
+    // PowerShell GDI screenshot — works on all Windows 10+ machines with no extra deps
+    let script = format!(
+        "Add-Type -AssemblyName System.Drawing,System.Windows.Forms; \
+         $s=[System.Windows.Forms.Screen]::PrimaryScreen; \
+         $b=New-Object System.Drawing.Bitmap($s.Bounds.Width,$s.Bounds.Height); \
+         $g=[System.Drawing.Graphics]::FromImage($b); \
+         $g.CopyFromScreen($s.Bounds.X,$s.Bounds.Y,0,0,$s.Bounds.Size); \
+         $b.Save('{}'); \
+         $g.Dispose(); $b.Dispose()",
+        tmp_str.replace('\'', "''")
+    );
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e: std::io::Error| e.to_string())?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Screenshot error: {}", err.trim()));
+    }
+
+    let bytes = std::fs::read(&tmp_path).map_err(|e| format!("Read error: {e}"))?;
+    Ok(base64_encode(&bytes))
+}
+
+/// OCR the given image file using Windows.Media.Ocr (WinRT, Windows 10+).
+/// Returns plain extracted text.
+#[tauri::command]
+async fn ocr_screen(image_path: String) -> Result<String, String> {
+    // Write PS script to temp file to avoid command-line length limits
+    let script_path = std::env::temp_dir().join("offlineai_ocr.ps1");
+    let img_escaped = image_path.replace('\'', "''");
+
+    let script = format!(
+        r#"Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+$asTaskG = ([System.WindowsRuntimeSystemExtensions].GetMethods() |
+    Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }})[0]
+function Await($t, $r) {{
+    $tt = $asTaskG.MakeGenericMethod($r); $n = $tt.Invoke($null, @($t)); $n.Wait(-1)|Out-Null; $n.Result
+}}
+try {{
+    $f = Await([Windows.Storage.StorageFile]::GetFileFromPathAsync('{}')) ([Windows.Storage.StorageFile])
+    $s = Await($f.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStream])
+    $d = Await([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($s)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $bm = Await($d.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    $eng = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    $res = Await($eng.RecognizeAsync($bm)) ([Windows.Media.Ocr.OcrResult])
+    Write-Output $res.Text
+}} catch {{ Write-Output "OCR_ERROR: $_" }}"#,
+        img_escaped
+    );
+
+    std::fs::write(&script_path, &script).map_err(|e| e.to_string())?;
+    let script_str = script_path.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", &script_str])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e: std::io::Error| e.to_string())?;
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() { "No text found in image".into() } else { err });
+    }
+    Ok(text)
+}
+
+// ── Conversation persistence (stored on client machine, never on our servers) ─
+
+fn get_db_path(app: &tauri::AppHandle) -> std::path::PathBuf {
+    app.path().app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("offlineai"))
+        .join("conversations.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct StoredMessage {
+    role:       String,
+    content:    String,
+    model:      String,
+    tokens:     u32,
+    timestamp:  u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct StoredConversation {
+    id:        String,
+    title:     String,
+    timestamp: u64,
+    language:  String,
+    messages:  Vec<StoredMessage>,
+}
+
+fn read_conv_db(path: &std::path::Path) -> Vec<StoredConversation> {
+    if !path.exists() { return vec![]; }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_conv_db(path: &std::path::Path, convs: &[StoredConversation]) {
+    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+    if let Ok(json) = serde_json::to_string_pretty(convs) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+#[tauri::command]
+fn db_save_conversation(app: tauri::AppHandle, conversation: StoredConversation) -> Result<(), String> {
+    let path = get_db_path(&app);
+    let mut convs = read_conv_db(&path);
+    if let Some(pos) = convs.iter().position(|c| c.id == conversation.id) {
+        convs[pos] = conversation;
+    } else {
+        convs.insert(0, conversation);
+        if convs.len() > 500 { convs.truncate(500); }
+    }
+    write_conv_db(&path, &convs);
+    Ok(())
+}
+
+#[tauri::command]
+fn db_get_conversations(app: tauri::AppHandle, limit: Option<usize>) -> Vec<StoredConversation> {
+    let path  = get_db_path(&app);
+    let convs = read_conv_db(&path);
+    let lim   = limit.unwrap_or(50);
+    convs.into_iter().take(lim).collect()
+}
+
+#[tauri::command]
+fn db_delete_conversation(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let path  = get_db_path(&app);
+    let convs = read_conv_db(&path).into_iter().filter(|c| c.id != id).collect::<Vec<_>>();
+    write_conv_db(&path, &convs);
+    Ok(())
+}
+
+#[tauri::command]
+fn db_get_stats(app: tauri::AppHandle) -> serde_json::Value {
+    let path  = get_db_path(&app);
+    let convs = read_conv_db(&path);
+    let total_msgs: usize  = convs.iter().map(|c| c.messages.len()).sum();
+    let claude_msgs: usize = convs.iter().flat_map(|c| c.messages.iter()).filter(|m| m.model == "claude").count();
+    let local_msgs: usize  = convs.iter().flat_map(|c| c.messages.iter()).filter(|m| m.model == "local").count();
+    let total_tokens: u64  = convs.iter().flat_map(|c| c.messages.iter()).map(|m| m.tokens as u64).sum();
+    serde_json::json!({
+        "totalConversations": convs.len(),
+        "totalMessages":      total_msgs,
+        "claudeMessages":     claude_msgs,
+        "localMessages":      local_msgs,
+        "totalTokens":        total_tokens,
+        "storagePath":        path.to_string_lossy()
+    })
+}
+
+/// Return the path where take_screenshot / capture_region save the PNG.
+/// The frontend passes this directly to ocr_screen so paths always match.
+#[tauri::command]
+fn get_screenshot_path() -> String {
+    std::env::temp_dir()
+        .join("offlineai_screen.png")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// List all visible top-level windows with their screen bounds.
+/// Returns [{title, process, x, y, width, height}].
+#[tauri::command]
+async fn list_windows() -> Result<Vec<serde_json::Value>, String> {
+    let script_path = std::env::temp_dir().join("offlineai_windows.ps1");
+
+    // Raw string — no format! needed, no escaping headaches.
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WH {
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
+}
+"@
+$results = @()
+Get-Process |
+  Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -ne "" } |
+  ForEach-Object {
+    $r = New-Object WH+RECT
+    if ([WH]::GetWindowRect($_.MainWindowHandle, [ref]$r)) {
+      $w = $r.R - $r.L; $h = $r.B - $r.T
+      if ($w -gt 80 -and $h -gt 80) {
+        $results += [ordered]@{
+          title   = $_.MainWindowTitle
+          process = $_.ProcessName
+          x       = [int]$r.L
+          y       = [int]$r.T
+          width   = [int]$w
+          height  = [int]$h
+        }
+      }
+    }
+  }
+if ($results.Count -eq 0) { Write-Output '[]'; exit }
+@($results) | ConvertTo-Json -Compress
+"#;
+
+    std::fs::write(&script_path, script).map_err(|e| e.to_string())?;
+    let script_str = script_path.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", &script_str])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e: std::io::Error| e.to_string())?;
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() || raw == "[]" {
+        return Ok(vec![]);
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or(serde_json::Value::Array(vec![]));
+
+    Ok(match parsed {
+        serde_json::Value::Array(arr) => arr,
+        obj @ serde_json::Value::Object(_) => vec![obj],
+        _ => vec![],
+    })
+}
+
+/// Capture a specific region of the primary monitor (screen coordinates).
+/// Saves the cropped PNG to the same temp file as take_screenshot so OCR
+/// works identically. Returns the cropped image as base64-encoded PNG.
+#[tauri::command]
+async fn capture_region(x: i32, y: i32, width: i32, height: i32) -> Result<String, String> {
+    let tmp_path  = std::env::temp_dir().join("offlineai_screen.png");
+    let script_path = std::env::temp_dir().join("offlineai_capture.ps1");
+
+    // Use forward slashes — both PowerShell and Windows handle them fine.
+    let save_path = tmp_path.to_string_lossy().replace('\\', "/");
+
+    // Positional format! params: {0}=x {1}=y {2}=width {3}=height {4}=path
+    // `{{` and `}}` produce literal `{` and `}` in the final string (valid PS).
+    let script = format!(
+        "Add-Type -AssemblyName System.Drawing,System.Windows.Forms\n\
+         $scr=[System.Windows.Forms.Screen]::PrimaryScreen\n\
+         $bFull=New-Object System.Drawing.Bitmap($scr.Bounds.Width,$scr.Bounds.Height)\n\
+         $g=[System.Drawing.Graphics]::FromImage($bFull)\n\
+         $g.CopyFromScreen($scr.Bounds.X,$scr.Bounds.Y,0,0,$bFull.Size)\n\
+         $cX=[Math]::Max(0,({0})-$scr.Bounds.X)\n\
+         $cY=[Math]::Max(0,({1})-$scr.Bounds.Y)\n\
+         $cW=[Math]::Min(({2}),$scr.Bounds.Width-$cX)\n\
+         $cH=[Math]::Min(({3}),$scr.Bounds.Height-$cY)\n\
+         if($cW -gt 0 -and $cH -gt 0){{\n\
+             $b2=$bFull.Clone([System.Drawing.Rectangle]::new($cX,$cY,$cW,$cH),$bFull.PixelFormat)\n\
+             $b2.Save('{4}')\n\
+             $b2.Dispose()\n\
+         }}else{{$bFull.Save('{4}')}}\n\
+         $g.Dispose();$bFull.Dispose()",
+        x, y, width, height, save_path
+    );
+
+    std::fs::write(&script_path, &script).map_err(|e| e.to_string())?;
+    let script_str = script_path.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", &script_str])
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e: std::io::Error| e.to_string())?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() { "capture_region failed".into() } else { err });
+    }
+
+    let bytes = std::fs::read(&tmp_path).map_err(|e| format!("Read error: {e}"))?;
+    Ok(base64_encode(&bytes))
+}
+
+/// Minimal base64 encoder — avoids an extra crate dependency.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for c in data.chunks(3) {
+        let b0 = c[0] as usize;
+        let b1 = if c.len() > 1 { c[1] as usize } else { 0 };
+        let b2 = if c.len() > 2 { c[2] as usize } else { 0 };
+        out.push(T[b0 >> 2] as char);
+        out.push(T[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        out.push(if c.len() > 1 { T[((b1 & 15) << 2) | (b2 >> 6)] as char } else { '=' });
+        out.push(if c.len() > 2 { T[b2 & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[tauri::command]
+fn get_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 // ── Model loading / inference ─────────────────────────────────────────────────
@@ -471,7 +870,9 @@ async fn load_model(
         .current_dir(exe.parent().unwrap_or(std::path::Path::new(".")))
         .arg("--model").arg(&model_path)
         .arg("--port").arg(SERVER_PORT.to_string())
-        .arg("--ctx-size").arg("32768")
+        .arg("--ctx-size").arg("8192")
+        .arg("--threads").arg("4")
+        .arg("--batch-size").arg("512")
         .stdout(std::process::Stdio::null())
         .stderr(stderr_file)
         .spawn()
@@ -617,6 +1018,35 @@ async fn generate(
     Ok(())
 }
 
+// ── Excel Add-in HTTP server ──────────────────────────────────────────────────
+// Serves the taskpane.html and taskpane.js files on http://localhost:8089
+// so the Office add-in manifest can load them from Excel's task pane.
+
+const ADDIN_HTML: &str = include_str!("../assets/excel-addin/taskpane.html");
+const ADDIN_JS:   &str = include_str!("../assets/excel-addin/taskpane.js");
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn handle_addin_http(mut stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 2048];
+    let n = match stream.read(&mut buf).await { Ok(n) => n, Err(_) => return };
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req.lines().next().unwrap_or("");
+
+    let (content_type, body): (&str, &str) = if first_line.contains("taskpane.js") {
+        ("application/javascript", ADDIN_JS)
+    } else {
+        ("text/html; charset=utf-8", ADDIN_HTML)
+    };
+
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+}
+
 // ── Extension Hub (desktop-only WebSocket server) ────────────────────────────
 // Runs on ws://127.0.0.1:7471 — VS Code / Cursor extensions connect here.
 // Each connected editor gets its own entry in HubState::clients.
@@ -731,6 +1161,111 @@ async fn handle_hub_connection(
                     "clientId": id,
                     "text": val["text"].as_str().unwrap_or("")
                 }));
+            }
+            Some("excel_query") => {
+                // Excel add-in pre-computes ratios/lookups in JS and sends:
+                //   dataStr     — compact human-readable table
+                //   computedStr — pre-calculated result (if found)
+                //   hasComputed — whether JS resolved the answer
+                let question     = val["question"].as_str().unwrap_or("").to_string();
+                let data_str     = val["dataStr"].as_str().unwrap_or("").to_string();
+                let computed_str = val["computedStr"].as_str().unwrap_or("").to_string();
+                let has_computed = val["hasComputed"].as_bool().unwrap_or(false);
+
+                // Build prompt differently depending on whether JS already computed the answer
+                let prompt = if has_computed {
+                    format!(
+                        "<|im_start|>system\n\
+You are a financial analyst assistant. A calculation has already been performed for the user.\
+<|im_end|>\n\
+<|im_start|>user\n\
+EXCEL DATA:\n{data_str}\n\
+{computed_str}\n\
+QUESTION: {question}\n\
+The pre-computed result above is correct. Present it clearly to the user, explain what it means \
+in plain English, and add brief financial interpretation (is this good/bad/normal for the industry?). \
+Be concise — 3-5 sentences max.\
+<|im_end|>\n\
+<|im_start|>assistant\n"
+                    )
+                } else {
+                    format!(
+                        "<|im_start|>system\n\
+You are a financial analyst assistant. The user has selected cells from an Excel spreadsheet.\n\
+Rules:\n\
+- Use ONLY the exact values shown below. Never invent or assume numbers.\n\
+- If you need to calculate something, show your working step by step.\n\
+- If a required value is missing, say so clearly — do not guess.\n\
+- Be concise. No padding or restating the question.\
+<|im_end|>\n\
+<|im_start|>user\n\
+EXCEL DATA:\n{data_str}\n\
+QUESTION: {question}\
+<|im_end|>\n\
+<|im_start|>assistant\n"
+                    )
+                };
+
+                // Grab tx without holding the lock during streaming
+                let tx_opt = {
+                    let lock = clients.lock().await;
+                    lock.get(&id).map(|c| c.tx.clone())
+                };
+
+                if let Some(tx) = tx_opt {
+                    let port = SERVER_PORT;
+                    tauri::async_runtime::spawn(async move {
+                        use futures_util::StreamExt;
+                        let client = reqwest::Client::new();
+                        let body = serde_json::json!({
+                            "prompt": prompt,
+                            "n_predict": 2048,
+                            "temperature": 0.5,
+                            "stream": true,
+                            "repeat_penalty": 1.1,
+                            "top_k": 40,
+                            "top_p": 0.95,
+                        });
+                        let res = match client
+                            .post(format!("http://127.0.0.1:{port}/completion"))
+                            .json(&body).send().await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = tx.send(serde_json::json!({"type":"error","message":e.to_string()}).to_string());
+                                return;
+                            }
+                        };
+                        let mut stream = res.bytes_stream();
+                        let mut buf = String::new();
+                        'stream: while let Some(chunk) = stream.next().await {
+                            if let Ok(bytes) = chunk {
+                                buf.push_str(&String::from_utf8_lossy(&bytes));
+                                loop {
+                                    if let Some(pos) = buf.find("\n\n") {
+                                        let event = buf[..pos].to_string();
+                                        buf = buf[pos + 2..].to_string();
+                                        for line in event.lines() {
+                                            if let Some(data) = line.strip_prefix("data: ") {
+                                                if let Ok(j) = serde_json::from_str::<serde_json::Value>(data) {
+                                                    if let Some(text) = j["content"].as_str() {
+                                                        if !text.is_empty() {
+                                                            let _ = tx.send(serde_json::json!({"type":"token","content":text}).to_string());
+                                                        }
+                                                    }
+                                                    if j["stop"].as_bool().unwrap_or(false) {
+                                                        let _ = tx.send(serde_json::json!({"type":"done"}).to_string());
+                                                        break 'stream;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else { break; }
+                                }
+                            }
+                        }
+                        let _ = tx.send(serde_json::json!({"type":"done"}).to_string());
+                    });
+                }
             }
             Some("pong") => {} // keepalive — ignore
             _ => {}
@@ -871,6 +1406,249 @@ async fn pubmed_search(query: String, max_results: u32) -> Result<String, String
     Ok(abstracts)
 }
 
+// ── Security Shield commands ──────────────────────────────────────────────────
+
+#[tauri::command]
+fn shield_protect(
+    _app: AppHandle,
+    state: tauri::State<'_, ShieldState>,
+    path: String,
+    file_type: String,
+) -> Result<serde_json::Value, String> {
+    use std::time::UNIX_EPOCH;
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let mtime = meta.modified().ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let atime = meta.accessed().ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let size = meta.len();
+    let file_name = std::path::Path::new(&path)
+        .file_name().unwrap_or_default().to_string_lossy().to_string();
+
+    // Generate decoy
+    let decoy_path = generate_decoy_file(&path, &file_type).ok();
+
+    let entry = ShieldEntry {
+        path: path.clone(),
+        file_name,
+        file_type,
+        decoy_path: decoy_path.clone(),
+        baseline_mtime: mtime,
+        baseline_size: size,
+        baseline_atime: atime,
+    };
+    state.entries.lock().unwrap().insert(path.clone(), entry);
+    Ok(serde_json::json!({ "protected": true, "decoyPath": decoy_path }))
+}
+
+#[tauri::command]
+fn shield_unprotect(state: tauri::State<'_, ShieldState>, path: String) -> Result<(), String> {
+    state.entries.lock().unwrap().remove(&path);
+    Ok(())
+}
+
+#[tauri::command]
+fn shield_get_log(state: tauri::State<'_, ShieldState>) -> Vec<ShieldLogEntry> {
+    state.log.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn shield_get_protected(state: tauri::State<'_, ShieldState>) -> Vec<ShieldEntry> {
+    state.entries.lock().unwrap().values().cloned().collect()
+}
+
+// ── shield_check_files: called every 3 s from JS to detect tampering ─────────
+// Compares current mtime / atime / size against the baseline captured at
+// protect-time.  Emits "shield-alert" for every changed file and updates the
+// baseline so we don't repeat the same alert.
+#[tauri::command]
+fn shield_check_files(
+    app: AppHandle,
+    state: tauri::State<'_, ShieldState>,
+) -> Vec<ShieldLogEntry> {
+    let mut fired: Vec<ShieldLogEntry> = Vec::new();
+
+    // Collect snapshot so we hold the lock as briefly as possible
+    let paths: Vec<String> = {
+        state.entries.lock().unwrap().keys().cloned().collect()
+    };
+
+    for path in paths {
+        let (baseline_mtime, baseline_size, baseline_atime, file_name) = {
+            let lock = state.entries.lock().unwrap();
+            let e = match lock.get(&path) { Some(v) => v, None => continue };
+            (e.baseline_mtime, e.baseline_size, e.baseline_atime, e.file_name.clone())
+        };
+
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                // File gone — alert
+                let entry = make_log_entry(&state, &path, &file_name, "deleted");
+                let _ = app.emit("shield-alert", &entry);
+                push_log(&state, entry.clone());
+                fired.push(entry);
+                // Remove so we don't keep alerting
+                state.entries.lock().unwrap().remove(&path);
+                continue;
+            }
+        };
+
+        let cur_mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0);
+        let cur_size  = meta.len();
+        let cur_atime = meta.accessed().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0);
+
+        let modified = cur_mtime != baseline_mtime || cur_size != baseline_size;
+        let accessed = !modified && cur_atime > baseline_atime + 2; // >2 s grace
+
+        if modified || accessed {
+            let event = if modified { "modified" } else { "accessed" };
+            let entry = make_log_entry(&state, &path, &file_name, event);
+            let _ = app.emit("shield-alert", &entry);
+            push_log(&state, entry.clone());
+            fired.push(entry);
+
+            // Update baseline so we don't re-fire for the same change
+            let mut lock = state.entries.lock().unwrap();
+            if let Some(e) = lock.get_mut(&path) {
+                e.baseline_mtime  = cur_mtime;
+                e.baseline_size   = cur_size;
+                e.baseline_atime  = cur_atime;
+            }
+        }
+    }
+
+    fired
+}
+
+fn make_log_entry(state: &tauri::State<'_, ShieldState>, path: &str, file_name: &str, event: &str) -> ShieldLogEntry {
+    let id = state.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Simple UTC HH:MM:SS (good enough for alerts)
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs();
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    ShieldLogEntry {
+        id,
+        timestamp: format!("{:02}:{:02}:{:02}", h, m, s),
+        path: path.to_string(),
+        file_name: file_name.to_string(),
+        event: event.to_string(),
+    }
+}
+
+fn push_log(state: &tauri::State<'_, ShieldState>, entry: ShieldLogEntry) {
+    let mut log = state.log.lock().unwrap();
+    log.insert(0, entry);
+    if log.len() > 100 { log.pop(); }
+}
+
+fn generate_decoy_file(path: &str, file_type: &str) -> Result<String, String> {
+    use rand::Rng;
+    let stem = std::path::Path::new(path)
+        .file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let parent = std::path::Path::new(path)
+        .parent().unwrap_or(std::path::Path::new("."));
+
+    if file_type == "excel" {
+        use calamine::{open_workbook_auto, Reader, Data};
+        use rust_xlsxwriter::Workbook;
+        let mut rng = rand::thread_rng();
+        let mut wb: calamine::Sheets<_> = open_workbook_auto(path).map_err(|e| e.to_string())?;
+        let sheet_names: Vec<String> = wb.sheet_names().to_vec();
+        let mut workbook = Workbook::new();
+        for sheet_name in &sheet_names {
+            if let Ok(range) = wb.worksheet_range(sheet_name) {
+                let ws = workbook.add_worksheet();
+                let _ = ws.set_name(sheet_name);
+                for (row_idx, row) in range.rows().enumerate() {
+                    for (col_idx, cell) in row.iter().enumerate() {
+                        match cell {
+                            Data::Float(f) => {
+                                let factor: f64 = rng.gen_range(0.6..1.4);
+                                let _ = ws.write(row_idx as u32, col_idx as u16, f * factor);
+                            }
+                            Data::Int(i) => {
+                                let factor: f64 = rng.gen_range(0.6..1.4);
+                                let _ = ws.write(row_idx as u32, col_idx as u16, (*i as f64 * factor) as i64);
+                            }
+                            Data::String(s) => {
+                                let fake = if s.len() > 16 && s.chars().any(|c| c.is_alphanumeric()) && !s.contains(' ') {
+                                    fake_credential(s)
+                                } else {
+                                    s.clone()
+                                };
+                                let _ = ws.write(row_idx as u32, col_idx as u16, fake.as_str());
+                            }
+                            Data::Bool(b) => { let _ = ws.write(row_idx as u32, col_idx as u16, *b); }
+                            Data::Empty => {}
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        let decoy_path = parent.join(format!("{}_decoy.xlsx", stem));
+        workbook.save(&decoy_path).map_err(|e| e.to_string())?;
+        Ok(decoy_path.to_string_lossy().to_string())
+    } else {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let decoy_text = obfuscate_code(&text, file_type);
+        let ext = std::path::Path::new(path)
+            .extension().unwrap_or_default().to_string_lossy().to_string();
+        let decoy_path = parent.join(format!("{}_decoy.{}", stem, ext));
+        std::fs::write(&decoy_path, decoy_text).map_err(|e| e.to_string())?;
+        Ok(decoy_path.to_string_lossy().to_string())
+    }
+}
+
+fn fake_credential(original: &str) -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let len = original.len().min(32);
+    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
+    let prefix = if original.contains('-') {
+        original.split('-').next().unwrap_or("").to_string() + "-fake-"
+    } else {
+        "decoy-".to_string()
+    };
+    let suffix: String = (0..len).map(|_| chars[rng.gen_range(0..chars.len())]).collect();
+    format!("{}{}", prefix, &suffix[..suffix.len().min(24)])
+}
+
+fn obfuscate_code(text: &str, _file_type: &str) -> String {
+    let patterns: &[(&str, &str)] = &[
+        (r#"(api[_-]?key\s*[=:]\s*['"])[^'"]+(['"])"#, "${1}decoy-00000000-fake-key${2}"),
+        (r#"(secret[_-]?key\s*[=:]\s*['"])[^'"]+(['"])"#, "${1}decoy-secret-00000000${2}"),
+        (r#"(password\s*[=:]\s*['"])[^'"]+(['"])"#, "${1}decoy-password-123${2}"),
+        (r#"(token\s*[=:]\s*['"])[^'"]+(['"])"#, "${1}decoy-token-00000000${2}"),
+        (r"(sk-[A-Za-z0-9]{20,})", "sk-decoy00000000000000000000000000"),
+        (r"(pk-[A-Za-z0-9]{20,})", "pk-decoy00000000000000000000000000"),
+        (r#"(mongodb://)[^\s'"]+"#, "${1}localhost:27017/decoy_db"),
+        (r#"(postgres://)[^\s'"]+"#, "${1}decoy:decoy@localhost/decoy_db"),
+        (r#"(mysql://)[^\s'"]+"#, "${1}decoy:decoy@localhost/decoy_db"),
+        (r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", "192.168.0.1"),
+    ];
+    let mut result = text.to_string();
+    for (pattern, replacement) in patterns {
+        if let Ok(re) = regex::Regex::new(pattern) {
+            result = re.replace_all(&result, *replacement).to_string();
+        }
+    }
+    result = format!("# [DECOY FILE - Generated by Codeforge AI Security Shield]\n# Monitor ID: shield-{:x}\n\n{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        result);
+    result
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Fetch the latest version JSON from a URL (GitHub raw or any host).
@@ -929,6 +1707,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(ServerState::new())
         .manage(HubState::new())
+        .manage(ShieldState::default())
         .setup(|app| {
             // Start the Extension Hub WebSocket server — desktop only.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -956,6 +1735,86 @@ pub fn run() {
                     }
                 });
             }
+            // Start Excel add-in HTTP server on port 8089
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            tauri::async_runtime::spawn(async move {
+                let listener = match tokio::net::TcpListener::bind("127.0.0.1:8089").await {
+                    Ok(l) => l,
+                    Err(e) => { eprintln!("[addin] Failed to bind port 8089: {e}"); return; }
+                };
+                eprintln!("[addin] Serving Excel add-in on http://127.0.0.1:8089");
+                loop {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        tokio::spawn(handle_addin_http(stream));
+                    }
+                }
+            });
+
+            // Spawn background security shield monitor
+            {
+                let shield_state = app.state::<ShieldState>();
+                // We need to hold an Arc-like reference — use app handle to access state in the async task
+                let app_clone = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        let shield = app_clone.state::<ShieldState>();
+                        let entries: Vec<ShieldEntry> = shield.entries.lock().unwrap().values().cloned().collect();
+                        for entry in entries {
+                            if let Ok(meta) = std::fs::metadata(&entry.path) {
+                                use std::time::UNIX_EPOCH;
+                                let mtime = meta.modified().ok()
+                                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs()).unwrap_or(0);
+                                let size = meta.len();
+                                if mtime != entry.baseline_mtime || size != entry.baseline_size {
+                                    {
+                                        let mut entries_lock = shield.entries.lock().unwrap();
+                                        if let Some(e) = entries_lock.get_mut(&entry.path) {
+                                            e.baseline_mtime = mtime;
+                                            e.baseline_size = size;
+                                        }
+                                    }
+                                    let id = shield.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    let ts = {
+                                        let secs = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                        let h = (secs % 86400) / 3600;
+                                        let m = (secs % 3600) / 60;
+                                        let s = secs % 60;
+                                        format!("{:02}:{:02}:{:02}", h, m, s)
+                                    };
+                                    let log_entry = ShieldLogEntry {
+                                        id,
+                                        timestamp: ts,
+                                        path: entry.path.clone(),
+                                        file_name: entry.file_name.clone(),
+                                        event: "modified".to_string(),
+                                    };
+                                    shield.log.lock().unwrap().push(log_entry.clone());
+                                    let _ = app_clone.emit("shield-alert", &log_entry);
+                                }
+                            } else {
+                                let id = shield.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let ts = {
+                                    let secs = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    format!("{:02}:{:02}:{:02}", (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60)
+                                };
+                                let log_entry = ShieldLogEntry {
+                                    id, timestamp: ts,
+                                    path: entry.path.clone(),
+                                    file_name: entry.file_name.clone(),
+                                    event: "deleted".to_string(),
+                                };
+                                shield.log.lock().unwrap().push(log_entry.clone());
+                                let _ = app_clone.emit("shield-alert", &log_entry);
+                            }
+                        }
+                    }
+                });
+                drop(shield_state); // avoid unused variable warning
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -964,13 +1823,26 @@ pub fn run() {
             get_models_dir_path,
             list_model_files,
             download_file,
+            cancel_download,
             delete_model,
             is_server_ready,
             setup_llama_server,
             reset_server,
             stop_generate,
             read_excel_sheets,
-            read_excel_multi,
+            list_directory,
+            read_file_text,
+            run_shell_command,
+            take_screenshot,
+            ocr_screen,
+            get_screenshot_path,
+            list_windows,
+            capture_region,
+            get_local_ip,
+            db_save_conversation,
+            db_get_conversations,
+            db_delete_conversation,
+            db_get_stats,
             load_model,
             unload_model,
             generate,
@@ -981,6 +1853,11 @@ pub fn run() {
             pubmed_search,
             check_for_update,
             install_update,
+            shield_protect,
+            shield_unprotect,
+            shield_get_log,
+            shield_get_protected,
+            shield_check_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

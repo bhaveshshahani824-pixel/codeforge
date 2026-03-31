@@ -1,12 +1,109 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { runExcelAgent, buildExcelSchema } from "./excelAgent.js";
+import QRCode from "qrcode";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readTextFile, readDir } from "@tauri-apps/plugin-fs";
 import { ClerkProvider, SignIn, useAuth } from "@clerk/react";
-import { Chart, registerables } from "chart.js";
-Chart.register(...registerables);
-Chart.defaults.animation = false;
+import * as WebLLM from "@mlc-ai/web-llm";
+import { pipeline, env as hfEnv } from "@huggingface/transformers";
+hfEnv.allowLocalModels = false;
+
+// ─── Cache Storage polyfill (needed when served over HTTP on LAN) ─────────────
+// Cache API is restricted to HTTPS/localhost; this IndexedDB shim enables WebLLM
+// to cache model weights on non-secure origins (e.g. http://192.168.x.x:1420).
+if (typeof caches === "undefined") {
+  const DB = "wllm-cache", ST = "kv";
+  const idb = () => new Promise((res, rej) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = e => e.target.result.createObjectStore(ST);
+    r.onsuccess = e => res(e.target.result);
+    r.onerror = rej;
+  });
+  const serialize = async r => {
+    const body = await r.arrayBuffer();
+    const hdrs = {}; r.headers.forEach((v, k) => { hdrs[k] = v; });
+    return { body, hdrs, status: r.status, statusText: r.statusText };
+  };
+  const deserialize = d => new Response(d.body, { status: d.status, statusText: d.statusText, headers: d.hdrs });
+  class IDBCache {
+    constructor(n) { this.n = n; }
+    key(r) { return `${this.n}::${typeof r === "string" ? r : r.url}`; }
+    async match(req) {
+      const db = await idb();
+      return new Promise(res => {
+        const r = db.transaction(ST).objectStore(ST).get(this.key(req));
+        r.onsuccess = e => res(e.target.result ? deserialize(e.target.result) : undefined);
+        r.onerror = () => res(undefined);
+      });
+    }
+    async matchAll(req) {
+      // Return all entries whose key starts with this cache name prefix
+      const db = await idb(), pfx = `${this.n}::`;
+      return new Promise(res => {
+        const r = db.transaction(ST).objectStore(ST).getAll();
+        r.onsuccess = e => {
+          const all = db.transaction(ST).objectStore(ST).getAllKeys();
+          all.onsuccess = k => {
+            const results = k.result
+              .map((key, i) => ({ key, val: e.target.result[i] }))
+              .filter(({ key }) => !req || key === `${this.n}::${typeof req === "string" ? req : req.url}`)
+              .map(({ val }) => deserialize(val));
+            res(results);
+          };
+          all.onerror = () => res([]);
+        };
+        r.onerror = () => res([]);
+      });
+    }
+    async add(req) {
+      // Fetch the resource and store it
+      const url = typeof req === "string" ? req : req.url;
+      const response = await fetch(req);
+      await this.put(url, response);
+    }
+    async addAll(requests) {
+      await Promise.all(requests.map(r => this.add(r)));
+    }
+    async put(req, resp) {
+      const data = await serialize(resp); const db = await idb();
+      return new Promise((res, rej) => {
+        const tx = db.transaction(ST, "readwrite");
+        tx.objectStore(ST).put(data, this.key(req));
+        tx.oncomplete = res; tx.onerror = rej;
+      });
+    }
+    async delete(req) {
+      const db = await idb();
+      return new Promise(res => {
+        const tx = db.transaction(ST, "readwrite");
+        tx.objectStore(ST).delete(this.key(req));
+        tx.oncomplete = () => res(true); tx.onerror = () => res(false);
+      });
+    }
+    async keys() {
+      const db = await idb(), pfx = `${this.n}::`;
+      return new Promise(res => {
+        const r = db.transaction(ST).objectStore(ST).getAllKeys();
+        r.onsuccess = e => res(
+          e.target.result
+            .filter(k => k.startsWith(pfx))
+            .map(k => new Request(k.slice(pfx.length)))
+        );
+        r.onerror = () => res([]);
+      });
+    }
+  }
+  const map = new Map();
+  window.caches = {
+    open: async n => { if (!map.has(n)) map.set(n, new IDBCache(n)); return map.get(n); },
+    match: async req => { for (const c of map.values()) { const m = await c.match(req); if (m) return m; } },
+    has: async n => map.has(n),
+    delete: async n => { map.delete(n); return true; },
+    keys: async () => [...map.keys()],
+  };
+}
 
 // ─── Color tokens ─────────────────────────────────────────────────────────────
 const C = {
@@ -52,6 +149,10 @@ const IC = {
   table:    "M3 10h18M3 14h18M10 3v18M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z",
   globe:    "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z",
   hub:      "M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2v-4M9 21H5a2 2 0 0 1-2-2v-4m0 0h18",
+  agent:    "M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-1H2a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73A2 2 0 0 1 10 4a2 2 0 0 1 2-2zm-3 9a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm6 0a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm-3 4a3 3 0 0 0-2.83 2h5.66A3 3 0 0 0 12 15z",
+  stop2:    "M6 6h12v12H6z",
+  mic:      "M12 1a3 3 0 0 1 3 3v8a3 3 0 0 1-6 0V4a3 3 0 0 1 3-3zm-1 16.93V21h-2v2h6v-2h-2v-3.07A8 8 0 0 0 20 12h-2a6 6 0 0 1-12 0H4a8 8 0 0 0 7 7.93z",
+  qr:       "M3 3h6v6H3zM15 3h6v6h-6zM3 15h6v6H3zM11 11h2v2h-2zM13 13h2v2h-2zM15 11h2v2h-2zM11 15h2v2h-2zM13 17h2v2h-2zM15 15h2v2h-2zM17 17h2v2h-2zM17 11h4v2h-4zM11 13h2v4h-2z",
   code:     "M16 18l6-6-6-6M8 6l-6 6 6 6",
   apply:    "M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 0 0 1.946-.806 3.42 3.42 0 0 1 4.438 0 3.42 3.42 0 0 0 1.946.806 3.42 3.42 0 0 1 3.138 3.138 3.42 3.42 0 0 0 .806 1.946 3.42 3.42 0 0 1 0 4.438 3.42 3.42 0 0 0-.806 1.946 3.42 3.42 0 0 1-3.138 3.138 3.42 3.42 0 0 0-1.946.806 3.42 3.42 0 0 1-4.438 0 3.42 3.42 0 0 0-1.946-.806 3.42 3.42 0 0 1-3.138-3.138 3.42 3.42 0 0 0-.806-1.946 3.42 3.42 0 0 1 0-4.438 3.42 3.42 0 0 0 .806-1.946 3.42 3.42 0 0 1 3.138-3.138z",
   pdf:      "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8",
@@ -62,6 +163,23 @@ const IC = {
   barChart: "M18 20V10M12 20V4M6 20v-6",
   warning:  "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01",
   info:     "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 8h.01M12 12v4",
+  music:    "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0",
+  vol:      "M11 5L6 9H2v6h4l5 4V5zM19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07",
+  play:     "M5 3l14 9-14 9V3z",
+  waveform: "M2 12h2M6 8v8M10 5v14M14 9v6M18 6v12M22 10v4",
+  chat:     "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
+  gamepad:  "M6 12h4M8 10v4M15 11h.01M18 11h.01M5 5h14a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z",
+  arrowL:   "M15 18l-6-6 6-6",
+  arrowR:   "M9 18l6-6-6-6",
+  arrowU:   "M18 15l-6-6-6 6",
+  arrowD:   "M6 9l6 6 6-6",
+  restart:  "M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4-4.64 4.36A9 9 0 0 1 3.51 15",
+  trophy:   "M6 9H4a2 2 0 0 1-2-2V5h4M18 9h2a2 2 0 0 0 2-2V5h-4M12 17v4m-4 0h8M8 9a4 4 0 0 0 8 0V3H8v6z",
+  workflow: "M5 3a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2H5zM5 11a2 2 0 0 0-2 2v2a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2v-2a2 2 0 0 0-2-2H5zM11 5h10M11 13h10M21 3l-6 6M21 11l-6 6",
+  screen:   "M2 3a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h6l-1 3H6v1h12v-1h-1l-1-3h6a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1H2zm1 2h18v11H3V5z",
+  camera:   "M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",
+  scan:     "M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M8 12h8",
+  eye:      "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
 };
 
 // ─── Research Models (GGUF — runs via llama.cpp, no WebView memory limits) ────
@@ -294,6 +412,69 @@ function retrieveContext(connectors, query, topK = 8) {
   // Large doc: prefer scored chunks; fallback to top scored.
   const withScore = all.filter(c => c.score > 0);
   return (withScore.length > 0 ? withScore : all).slice(0, topK);
+}
+
+// ─── Live Source Reader ────────────────────────────────────────────────────────
+// Re-reads connected files from disk on every query so the LLM sees the FULL,
+// up-to-date data — not keyword-matched fragments from a stale index.
+// Excel → full markdown table per sheet
+// PDF / DOCX → full extracted text (up to 14k chars)
+// Falls back to stored chunks if the file can't be read (moved/deleted/locked).
+async function readSourcesLive(connectors) {
+  const parts = [];
+  for (const c of connectors) {
+    try {
+      if (c.type === "pubmed" || !c.path) {
+        if (c.chunks?.length) {
+          const txt = c.chunks.slice(0, 16)
+            .map(ch => (typeof ch === "string" ? ch : ch.text || "")).join("\n\n");
+          parts.push(`## ${c.name}\n${txt}`);
+        }
+        continue;
+      }
+      if (c.type === "excel") {
+        const data = await invoke("read_excel_sheets", { path: c.path });
+        const sheetsToRead = (data.sheets || []).filter(s => !c.activeSheets || c.activeSheets.includes(s.name)).slice(0, 4);
+        for (const sheet of sheetsToRead) {
+          const rows = (sheet.rows || []).filter(r =>
+            r.some(v => v !== null && v !== undefined && v !== "")
+          );
+          if (!rows.length) continue;
+          const headers = rows[0].map(h => String(h ?? "").trim() || "—");
+          const MAX_ROWS = 80;
+          const dataRows = rows.slice(1, MAX_ROWS + 1);
+          const truncated = rows.length - 1 > MAX_ROWS;
+          const mdHead = `| ${headers.join(" | ")} |`;
+          const mdSep  = `| ${headers.map(() => "---").join(" | ")} |`;
+          const mdBody = dataRows.map(r =>
+            `| ${headers.map((_, i) => String(r[i] ?? "").trim()).join(" | ")} |`
+          ).join("\n");
+          const truncNote = truncated ? `\n[Table truncated: showing ${MAX_ROWS} of ${rows.length - 1} rows]` : "";
+          parts.push(`## ${c.name} — Sheet: ${sheet.name}\n${mdHead}\n${mdSep}\n${mdBody}${truncNote}`);
+        }
+      } else if (c.type === "pdf") {
+        const text = await invoke("read_pdf", { path: c.path });
+        const trimmed = text.slice(0, 14000);
+        parts.push(`## ${c.name}\n${trimmed}${text.length > 14000 ? "\n[…document continues beyond context limit]" : ""}`);
+      } else if (c.type === "docx") {
+        const text = await invoke("read_docx", { path: c.path });
+        const trimmed = text.slice(0, 14000);
+        parts.push(`## ${c.name}\n${trimmed}${text.length > 14000 ? "\n[…document continues beyond context limit]" : ""}`);
+      } else if (c.path) {
+        const text = await invoke("read_file_text", { path: c.path });
+        parts.push(`## ${c.name}\n${text.slice(0, 8000)}`);
+      }
+    } catch (e) {
+      console.warn("[sources] failed live-read of", c.name, ":", e);
+      // Graceful fall-back to pre-indexed chunks
+      if (c.chunks?.length) {
+        const fallback = c.chunks.slice(0, 12)
+          .map(ch => (typeof ch === "string" ? ch : ch.text || "")).join("\n\n");
+        parts.push(`## ${c.name} (cached)\n${fallback}`);
+      }
+    }
+  }
+  return parts.length ? parts.join("\n\n---\n\n") : null;
 }
 
 // ─── Domain Analytics Engine ──────────────────────────────────────────────────
@@ -672,7 +853,7 @@ function detectLanguage(text) {
 // ─── Prompt engineering ───────────────────────────────────────────────────────
 function buildSystemPrompt(connectors, lang = "en") {
   const hasDocs = connectors.some(c => c.chunks?.length > 0);
-  const base = `You are Codeforge AI — a research assistant running 100% on this device. No data leaves this machine.\n\nACCURACY RULES (highest priority — always apply these before answering):\n- PREMISE CHECK: Before answering any math, science, or factual question, verify whether the user's stated facts, equations, or identities are correct. If the user's premise is FALSE or INCORRECT (e.g., a wrong equation like "sinθ + cosθ = 1" when the correct identity is "sin²θ + cos²θ = 1"), you MUST explicitly correct it first using "⚠️ Correction:" before explaining the right concept. Never build an explanation on a false premise — correcting the user is more helpful than confirming a mistake.\n- MATH NOTATION: Write math using plain Unicode text only (e.g., sin²θ + cos²θ = 1, √x, π, θ). Do NOT output raw LaTeX commands like \\sin, \\cos, \\frac{a}{b}, \\sqrt{} or \\text{} — these appear as broken garbled text to the user.\n- NO HALLUCINATION: Never invent facts, formulas, examples, or real-world applications you are not certain about. If you are unsure of an example, omit it or say "I'm not certain about this". It is far better to say "I don't know" than to fabricate a plausible-sounding but wrong answer.\n- CLEAN OUTPUT: Your response must use only the characters of the target language's script. Never mix in characters or words from unrelated writing systems (e.g., no Chinese/Arabic/Cyrillic characters in a French or English response). If you are about to output a character you cannot verify, omit it.\n\nRESPONSE RULES:\n- Be precise, cite sources when context is provided.\n- Structure complex answers with bullet points or sections.\n- If the answer is not in the provided context, say so — never hallucinate.\n- Prefer concise, evidence-based responses.\n- For Excel/financial data: calculate requested metrics from the numbers in the context; show your working.\n- Language identification: You understand ALL world languages. When asked "what language is this?", "which language is this?", or any similar question, ALWAYS explicitly state the full language name first (e.g., "This is French.", "This text is written in Arabic.", "This is Spanish."), then provide the translation or meaning. Never skip naming the language.`;
+  const base = `You are Codeforge AI — a research assistant running 100% on this device. No data leaves this machine.\n\nACCURACY RULES (highest priority — always apply these before answering):\n- PREMISE CHECK: Before answering any math, science, or factual question, verify whether the user's stated facts, equations, or identities are correct. If the user's premise is FALSE or INCORRECT (e.g., a wrong equation like "sinθ + cosθ = 1" when the correct identity is "sin²θ + cos²θ = 1"), you MUST explicitly correct it first using "⚠️ Correction:" before explaining the right concept. Never build an explanation on a false premise — correcting the user is more helpful than confirming a mistake.\n- MATH NOTATION: Write math using plain Unicode text only (e.g., sin²θ + cos²θ = 1, √x, π, θ). Do NOT output raw LaTeX commands like \\sin, \\cos, \\frac{a}{b}, \\sqrt{} or \\text{} — these appear as broken garbled text to the user.\n- NO HALLUCINATION: Never invent facts, formulas, examples, or real-world applications you are not certain about. If you are unsure of an example, omit it or say "I'm not certain about this". It is far better to say "I don't know" than to fabricate a plausible-sounding but wrong answer.\n- CLEAN OUTPUT: Your response must use only the characters of the target language's script. Never mix in characters or words from unrelated writing systems (e.g., no Chinese/Arabic/Cyrillic characters in a French or English response). If you are about to output a character you cannot verify, omit it.\n\nRESPONSE RULES:\n- Be precise, cite sources when context is provided.\n- Structure complex answers with bullet points or sections.\n- If the answer is not in the provided context, say so — never hallucinate.\n- Prefer concise, evidence-based responses.\n- CONCISENESS: Never repeat yourself. Each sentence must add new information. If the answer fits in one sentence, give one sentence — do not pad with restating the question, summaries of what you just said, or closing remarks like "In summary" or "To conclude".\n- Direct answers: For factual or numerical questions, state the answer first, then explain only if needed.\n- For Excel/financial data: calculate requested metrics from the numbers in the context; show your working.\n- Language identification: You understand ALL world languages. When asked "what language is this?", "which language is this?", or any similar question, ALWAYS explicitly state the full language name first (e.g., "This is French.", "This text is written in Arabic.", "This is Spanish."), then provide the translation or meaning. Never skip naming the language.`;
   const docInstr = hasDocs ? "\n\nDOCUMENT CONTEXT RULES (highest priority when context is provided):\n- The user has connected research documents. A \"--- Document context ---\" section will appear in their message with extracted text from those files.\n- You MUST answer the user's question using ONLY the information found in that context section. Quote or paraphrase directly from it.\n- If the answer is clearly present in the context, do NOT add general knowledge — stick to what the document says.\n- Cite the source file name when referencing specific content (e.g., \"According to [filename]...\").\n- Only if the context contains NO relevant information at all should you say so and offer a general answer as a fallback." : "";
   const langInstr = LANG_PROMPTS[lang] || "";
   return base + docInstr + langInstr;
@@ -680,24 +861,29 @@ function buildSystemPrompt(connectors, lang = "en") {
 
 // Build a raw prompt string for llama.cpp (no tokenizer required in JS).
 // Uses ChatML format (Qwen, Phi-3.5) or Gemma format depending on model.
-function buildPrompt(history, userText, ctxChunks, connectors, modelId, lang = "en") {
+function buildPrompt(history, userText, ctxChunks, connectors, modelId, lang = "en", liveCtx = null) {
   const sys = buildSystemPrompt(connectors, lang);
 
   // Context goes BEFORE the question so the model reads the document first,
   // then encounters the question with full context already in working memory.
-  const ctx = ctxChunks.length > 0
-    ? "The following passages are extracted from the user's connected document(s).\n" +
-      "Read them carefully, then answer the question below using ONLY this content.\n\n" +
-      "=== DOCUMENT CONTEXT ===\n" +
-      ctxChunks.map((c, i) => `[Passage ${i + 1} — ${c.source}]\n${c.text}`).join("\n\n") +
-      "\n=== END OF CONTEXT ===\n\nQuestion: "
-    : "";
+  let ctx = "";
+  if (liveCtx) {
+    // Live-read: full data from disk → best accuracy
+    ctx = "The following is the COMPLETE content from the user's connected data sources.\n" +
+          "Use this data to answer accurately. Never estimate or hallucinate values — if something is not in the data, say so clearly.\n\n" +
+          "=== CONNECTED DATA ===\n" + liveCtx + "\n=== END OF DATA ===\n\nQuestion: ";
+  } else if (ctxChunks.length > 0) {
+    ctx = "The following passages are extracted from the user's connected document(s).\n" +
+          "Read them carefully, then answer the question below using ONLY this content.\n\n" +
+          "=== DOCUMENT CONTEXT ===\n" +
+          ctxChunks.map((c, i) => `[Passage ${i + 1} — ${c.source}]\n${c.text}`).join("\n\n") +
+          "\n=== END OF CONTEXT ===\n\nQuestion: ";
+  }
 
   const isGemma = modelId.toLowerCase().includes("gemma");
 
-  // When lots of document context is present, reduce history to save token space.
-  // 0-2 chunks → 4 turns; 3+ chunks → 2 turns.
-  const histSlice = ctxChunks.length > 2 ? -2 : -4;
+  // When data context is present, reduce history to save token space.
+  const histSlice = (liveCtx || ctxChunks.length > 2) ? -2 : -4;
   const recentHistory = history.slice(histSlice);
 
   if (isGemma) {
@@ -786,7 +972,7 @@ function CalcCard({ calc }) {
 }
 
 // ─── Model Modal ──────────────────────────────────────────────────────────────
-function ModelModal({ modelState, activeModelId, hfToken, onTokenChange, onDownload, onLoad, onDelete, onResetServer, onClose }) {
+function ModelModal({ modelState, activeModelId, hfToken, onTokenChange, onDownload, onLoad, onDelete, onCancelDownload, onResetServer, onClose }) {
   const [selected, setSelected] = useState(activeModelId || MODELS[0].id);
   const [freeDiskMB, setFreeDiskMB] = useState(0);
 
@@ -957,8 +1143,16 @@ function ModelModal({ modelState, activeModelId, hfToken, onTokenChange, onDownl
             )}
 
             {state.status === "downloading" && (
-              <div style={{ flex: 1, padding: "11px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 9, color: C.amber, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                <Spinner /> Downloading…
+              <div style={{ flex: 1, display: "flex", gap: 8 }}>
+                <div style={{ flex: 1, padding: "11px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 9, color: C.amber, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                  <Spinner /> Downloading…
+                </div>
+                <Btn onClick={() => onCancelDownload(selected)} style={{
+                  padding: "11px 14px", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)",
+                  borderRadius: 9, color: C.red, fontSize: 12, fontWeight: 600, whiteSpace: "nowrap",
+                }}>
+                  Cancel
+                </Btn>
               </div>
             )}
 
@@ -1033,11 +1227,12 @@ function srcIcon(type) {
   return s ? { d: s.icon, color: s.color } : { d: IC.file, color: "#38bdf8" };
 }
 
-function ConnectorModal({ connectors, onAdd, onRemove, onClose }) {
+function ConnectorModal({ connectors, onAdd, onRemove, onClose, onUpdate }) {
   const [adding, setAdding]         = useState(null);
   const [status, setStatus]         = useState("");
   const [pubmedQuery, setPubmedQuery] = useState("");
   const [searching, setSearching]   = useState(false);
+  const [expandedId, setExpandedId] = useState(null);
 
   const done = (msg) => {
     setStatus(msg);
@@ -1072,8 +1267,9 @@ function ConnectorModal({ connectors, onAdd, onRemove, onClose }) {
         setStatus("Reading Excel sheets…");
         name = result.split(/[\\/]/).pop();
         let excelChunks = [];
+        let data = null;
         try {
-          const data = await invoke("read_excel_sheets", { path: result });
+          data = await invoke("read_excel_sheets", { path: result });
           for (const sheet of data.sheets) {
             const rows = sheet.rows;
             if (!rows.length) continue;
@@ -1102,7 +1298,13 @@ function ConnectorModal({ connectors, onAdd, onRemove, onClose }) {
           }
           name = `${name} (${data.sheets.length} sheet${data.sheets.length !== 1 ? "s" : ""})`;
         } catch (e) { setStatus("Error reading Excel: " + String(e)); return; }
-        onAdd({ id: Date.now(), name, path: result, type: "excel", chunks: excelChunks, sync: "Indexed" });
+        // Compute preview and sheet metadata
+        const sheetNames = data?.sheets?.map(s => s.name) || [];
+        const firstNonEmpty = data?.sheets?.find(s => s.rows?.length > 0);
+        const previewRows = firstNonEmpty ? firstNonEmpty.rows.slice(0, 6) : [];
+        const rowCounts = {};
+        for (const s of (data?.sheets || [])) { rowCounts[s.name] = s.rows?.length || 0; }
+        onAdd({ id: Date.now(), name, path: result, type: "excel", chunks: excelChunks, sync: "Indexed", sheets: sheetNames, activeSheets: sheetNames, previewRows, rowCounts });
         done(`✓ ${excelChunks.length} chunks indexed`);
 
       } else if (type === "pdf") {
@@ -1114,7 +1316,7 @@ function ConnectorModal({ connectors, onAdd, onRemove, onClose }) {
           text = await invoke("read_pdf", { path: result });
         } catch (e) { setStatus("Error reading PDF: " + String(e)); return; }
         const chunks = text ? chunkText(text) : [];
-        onAdd({ id: Date.now(), name, path: result, type: "pdf", chunks, sync: "Indexed" });
+        onAdd({ id: Date.now(), name, path: result, type: "pdf", chunks, sync: "Indexed", previewText: text.slice(0, 500) });
         done(`✓ ${chunks.length} chunks indexed`);
 
       } else if (type === "docx") {
@@ -1189,16 +1391,77 @@ function ConnectorModal({ connectors, onAdd, onRemove, onClose }) {
               <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 22 }}>
                 {connectors.map(c => {
                   const { d, color } = srcIcon(c.type);
+                  const isExpanded = expandedId === c.id;
+                  const hasPreview = c.type === "excel" || c.type === "pdf";
+                  const sheetsInfo = c.type === "excel" && c.sheets ? `${c.sheets.length} sheet${c.sheets.length !== 1 ? "s" : ""}` : c.type;
                   return (
-                    <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 10 }}>
-                      <Icon d={d} size={16} stroke={color} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13, color: C.t1, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</div>
-                        <div style={{ fontSize: 11, color: C.t3 }}>{c.chunks?.length || 0} chunks · {c.sync}</div>
+                    <div key={c.id} style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px" }}>
+                        <Icon d={d} size={16} stroke={color} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, color: C.t1, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</div>
+                          <div style={{ fontSize: 11, color: C.t3 }}>Live sync · {sheetsInfo}</div>
+                        </div>
+                        {hasPreview && (
+                          <Btn onClick={() => setExpandedId(isExpanded ? null : c.id)} style={{ background: isExpanded ? "rgba(59,130,246,0.12)" : C.bgPanel, border: `1px solid ${isExpanded ? C.borderHi : C.border}`, borderRadius: 6, color: isExpanded ? C.blue : C.t3, padding: "5px 8px", display: "flex" }}>
+                            <Icon d={IC.eye} size={13} />
+                          </Btn>
+                        )}
+                        <Btn onClick={() => onRemove(c.id)} style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 6, color: C.red, padding: "5px 8px", display: "flex" }}>
+                          <Icon d={IC.trash} size={13} />
+                        </Btn>
                       </div>
-                      <Btn onClick={() => onRemove(c.id)} style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 6, color: C.red, padding: "5px 8px", display: "flex" }}>
-                        <Icon d={IC.trash} size={13} />
-                      </Btn>
+                      {isExpanded && c.type === "excel" && (
+                        <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 14px" }}>
+                          {c.sheets && (
+                            <div style={{ marginBottom: 10 }}>
+                              <div style={{ fontSize: 10, color: C.t3, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Sheets</div>
+                              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                                {c.sheets.map(sh => {
+                                  const isActive = !c.activeSheets || c.activeSheets.includes(sh);
+                                  return (
+                                    <label key={sh} style={{ display: "flex", alignItems: "center", gap: 5, padding: "3px 9px", background: isActive ? "rgba(59,130,246,0.1)" : "transparent", border: `1px solid ${isActive ? C.borderHi : C.border}`, borderRadius: 20, cursor: "pointer", fontSize: 11, color: isActive ? C.blue : C.t3 }}>
+                                      <input type="checkbox" checked={isActive} style={{ margin: 0 }} onChange={() => {
+                                        const current = c.activeSheets || c.sheets || [];
+                                        const next = isActive ? current.filter(s => s !== sh) : [...current, sh];
+                                        if (onUpdate) onUpdate(c.id, { activeSheets: next });
+                                      }} />
+                                      {sh}
+                                      {c.rowCounts?.[sh] ? <span style={{ color: C.t3, fontSize: 10 }}>({c.rowCounts[sh]})</span> : null}
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                          {c.previewRows?.length > 0 && (
+                            <div>
+                              <div style={{ fontSize: 10, color: C.t3, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Preview (first 6 rows)</div>
+                              <div style={{ overflowX: "auto" }}>
+                                <table style={{ borderCollapse: "collapse", fontSize: 10.5, color: C.t2, width: "100%" }}>
+                                  <tbody>
+                                    {c.previewRows.map((row, ri) => (
+                                      <tr key={ri} style={{ borderBottom: `1px solid ${C.border}` }}>
+                                        {row.map((cell, ci) => (
+                                          <td key={ci} style={{ padding: "3px 8px", borderRight: `1px solid ${C.border}`, whiteSpace: "nowrap", fontWeight: ri === 0 ? 700 : 400, color: ri === 0 ? C.t1 : C.t2 }}>{cell ?? ""}</td>
+                                        ))}
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {isExpanded && c.type === "pdf" && c.previewText && (
+                        <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 14px" }}>
+                          <div style={{ fontSize: 10, color: C.t3, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Preview</div>
+                          <div style={{ maxHeight: 120, overflowY: "auto", fontSize: 11.5, color: C.t2, lineHeight: 1.6, fontFamily: "monospace", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                            {c.previewText}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1445,10 +1708,185 @@ function Typing() {
 // ─── Extension Hub Panel (desktop only) ───────────────────────────────────────
 // Shows connected VS Code / Cursor editors as separate subhubs with AI chat.
 // trialDaysLeft: number (≥1 = trial active, 0 = expired, null = not started yet)
-function HubPanel({ hubClients, activeHubId, setActiveHubId, hubStreaming, onSendHub, onApply, activeModelId, trialDaysLeft }) {
+function BugReportCard({ report, onRescan, scanning }) {
+  const [expanded, setExpanded] = useState(null);
+  if (!report && !scanning) return null;
+
+  const sevColor = (sev) => {
+    if (sev === "HIGH")   return "#ef4444";
+    if (sev === "MEDIUM") return "#f59e0b";
+    if (sev === "LOW")    return "#3b82f6";
+    return "#6b7280";
+  };
+  const sevBg = (sev) => {
+    if (sev === "HIGH")   return "rgba(239,68,68,0.1)";
+    if (sev === "MEDIUM") return "rgba(245,158,11,0.1)";
+    if (sev === "LOW")    return "rgba(59,130,246,0.1)";
+    return "rgba(107,114,128,0.1)";
+  };
+
+  return (
+    <div style={{ margin: "10px 14px 0", border: `1px solid ${C.border}`, borderRadius: 10, overflow: "hidden", background: C.bgCard }}>
+      <div style={{ padding: "10px 14px", borderBottom: report?.bugs?.length ? `1px solid ${C.border}` : "none", display: "flex", alignItems: "center", gap: 8, background: "rgba(239,68,68,0.05)" }}>
+        <span style={{ fontSize: 14 }}>🐛</span>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: C.t1 }}>
+            {scanning ? "Scanning for bugs…" : report?.bugs?.length === 0 ? "No issues found ✓" : `${report.bugs.length} issue${report.bugs.length !== 1 ? "s" : ""} found`}
+          </div>
+          {report?.scannedFile && (
+            <div style={{ fontSize: 10, color: C.t3 }}>{report.scannedFile.split(/[\\/]/).pop()}{report.scannedAt ? ` · ${report.scannedAt}` : ""}</div>
+          )}
+        </div>
+        {scanning ? (
+          <Spinner />
+        ) : (
+          <Btn onClick={onRescan} style={{ padding: "3px 10px", fontSize: 11, background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 6, color: C.t2, display: "flex", alignItems: "center", gap: 4 }}>
+            <Icon d={IC.refresh} size={11} /> Re-scan
+          </Btn>
+        )}
+      </div>
+      {!scanning && report?.bugs?.map((bug, i) => (
+        <div key={i} style={{ borderBottom: i < report.bugs.length - 1 ? `1px solid ${C.border}` : "none" }}>
+          <div onClick={() => setExpanded(expanded === i ? null : i)} style={{ padding: "9px 14px", cursor: "pointer", display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 10, background: sevBg(bug.severity), color: sevColor(bug.severity), flexShrink: 0, marginTop: 1 }}>
+              {bug.severity}
+            </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: C.t1 }}>{bug.title}</div>
+              {bug.line && <div style={{ fontSize: 10, color: C.t3 }}>Line {bug.line}</div>}
+            </div>
+            <span style={{ fontSize: 10, color: C.t3 }}>{expanded === i ? "▲" : "▼"}</span>
+          </div>
+          {expanded === i && (
+            <div style={{ padding: "0 14px 12px", borderTop: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: 12, color: C.t2, marginTop: 8, lineHeight: 1.6 }}>{bug.description}</div>
+              {bug.fix && (
+                <div style={{ marginTop: 8, padding: "8px 10px", background: "rgba(34,197,94,0.07)", border: "1px solid rgba(34,197,94,0.2)", borderRadius: 7 }}>
+                  <div style={{ fontSize: 10, color: "#22c55e", fontWeight: 700, marginBottom: 4 }}>SUGGESTED FIX</div>
+                  <div style={{ fontSize: 11.5, color: C.t2, fontFamily: "monospace", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{bug.fix}</div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SecurityShieldPanel({ shieldedFiles, securityLog, onProtect, onUnprotect, hubClients }) {
+  const [protecting, setProtecting] = useState(null);
+  const [error, setError] = useState("");
+
+  const handleProtect = async (path, fileType) => {
+    setProtecting(path);
+    setError("");
+    try {
+      await onProtect(path, fileType);
+    } catch (e) {
+      setError("Failed: " + String(e));
+    } finally {
+      setProtecting(null);
+    }
+  };
+
+  const connectedFiles = Object.values(hubClients)
+    .filter(c => c.file)
+    .map(c => ({ path: c.file, language: c.language, editor: c.editor }));
+
+  const uniqueFiles = [...new Map(connectedFiles.map(f => [f.path, f])).values()];
+
+  const eventColor = (ev) => ev === "modified" ? C.amber : C.red;
+  const eventIcon = (ev) => ev === "modified" ? "✏️" : "🗑️";
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: 18, display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ width: 36, height: 36, borderRadius: 10, background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.25)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>🛡️</div>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: C.t1 }}>Security Shield</div>
+          <div style={{ fontSize: 11, color: C.t3 }}>Protect files · Generate decoys · Monitor changes</div>
+        </div>
+      </div>
+
+      {error && <div style={{ padding: "8px 12px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 8, fontSize: 12, color: C.red }}>{error}</div>}
+
+      {/* Connected files from Hub */}
+      <div>
+        <div style={{ fontSize: 10, fontWeight: 700, color: C.t3, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Files Via Hub</div>
+        {uniqueFiles.length === 0 ? (
+          <div style={{ fontSize: 12, color: C.t3, padding: "10px 0" }}>No files connected via VS Code Hub yet.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+            {uniqueFiles.map(f => {
+              const isProtected = !!shieldedFiles[f.path];
+              const entry = shieldedFiles[f.path];
+              const fileName = f.path.split(/[\\/]/).pop();
+              const ext = fileName.split(".").pop()?.toLowerCase() || "";
+              const ftype = ["xlsx","xls","xlsm"].includes(ext) ? "excel" : ["pdf"].includes(ext) ? "pdf" : "code";
+              return (
+                <div key={f.path} style={{ padding: "11px 14px", background: isProtected ? "rgba(34,197,94,0.06)" : C.bgCard, border: `1px solid ${isProtected ? "rgba(34,197,94,0.3)" : C.border}`, borderRadius: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontSize: 16 }}>{isProtected ? "🛡️" : "📄"}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600, color: C.t1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{fileName}</div>
+                      <div style={{ fontSize: 10, color: C.t3 }}>{f.language || ext} · {f.path}</div>
+                    </div>
+                    {isProtected ? (
+                      <Btn onClick={() => onUnprotect(f.path)} style={{ padding: "4px 10px", fontSize: 11, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)", borderRadius: 6, color: C.red }}>
+                        Unprotect
+                      </Btn>
+                    ) : (
+                      <Btn onClick={() => handleProtect(f.path, ftype)} disabled={protecting === f.path} style={{ padding: "4px 10px", fontSize: 11, background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: 6, color: "#22c55e", display: "flex", alignItems: "center", gap: 4 }}>
+                        {protecting === f.path ? <Spinner /> : "🛡️ Protect"}
+                      </Btn>
+                    )}
+                  </div>
+                  {isProtected && entry?.decoyPath && (
+                    <div style={{ marginTop: 8, padding: "7px 10px", background: "rgba(34,197,94,0.05)", borderRadius: 7, fontSize: 11, color: C.t3 }}>
+                      ✓ Protected since {entry.protectedAt} · Decoy generated<br />
+                      <span style={{ fontFamily: "monospace", fontSize: 10, color: C.t2 }}>{entry.decoyPath.split(/[\\/]/).pop()}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Security Log */}
+      <div>
+        <div style={{ fontSize: 10, fontWeight: 700, color: C.t3, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          Security Log
+          {securityLog.length > 0 && <span style={{ fontSize: 10, padding: "1px 7px", background: "rgba(239,68,68,0.15)", borderRadius: 10, color: C.red }}>{securityLog.length}</span>}
+        </div>
+        {securityLog.length === 0 ? (
+          <div style={{ fontSize: 12, color: C.t3, padding: "10px 0" }}>No events recorded. Protected files will appear here when modifications are detected.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            {securityLog.slice(0, 20).map((entry, i) => (
+              <div key={entry.id || i} style={{ padding: "8px 12px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 8, display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <span style={{ fontSize: 13 }}>{eventIcon(entry.event)}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, color: eventColor(entry.event), fontWeight: 600 }}>{entry.file_name} — {entry.event}</div>
+                  <div style={{ fontSize: 10, color: C.t3, marginTop: 1 }}>{entry.timestamp} · {entry.path}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HubPanel({ hubClients, activeHubId, setActiveHubId, hubStreaming, onSendHub, onApply, activeModelId, trialDaysLeft, bugReports, onBugScan, shieldedFiles, securityLog, onShieldProtect, onShieldUnprotect }) {
   const [hubInput, setHubInput] = useState("");
   const hubInputRef = useRef(null);
   const hubBottomRef = useRef(null);
+  const [hubTab, setHubTab] = useState("chat"); // "chat" | "shield"
 
   const clientList = Object.values(hubClients);
   const active = hubClients[activeHubId] || clientList[0] || null;
@@ -1459,14 +1897,16 @@ function HubPanel({ hubClients, activeHubId, setActiveHubId, hubStreaming, onSen
 
   // Editor badge colour
   const editorColor = (editor) => {
-    if (editor === "cursor") return C.purple;
+    if (editor === "cursor")   return C.purple;
     if (editor === "windsurf") return C.green;
+    if (editor === "excel")    return "#1D6F42"; // Excel green
     return C.blue; // vscode
   };
 
   const editorLabel = (editor) => {
     if (editor === "cursor")   return "Cursor";
     if (editor === "windsurf") return "Windsurf";
+    if (editor === "excel")    return "Excel";
     return "VS Code";
   };
 
@@ -1519,6 +1959,26 @@ function HubPanel({ hubClients, activeHubId, setActiveHubId, hubStreaming, onSen
         </div>
       )}
 
+      {/* ── Tab bar ── */}
+      <div style={{ display: "flex", borderBottom: `1px solid ${C.border}`, background: C.bgPanel }}>
+        {[["chat", "💬 Chat"], ["shield", "🛡️ Shield"]].map(([id, label]) => (
+          <Btn key={id} onClick={() => setHubTab(id)} style={{
+            padding: "9px 18px", fontSize: 12, fontWeight: hubTab === id ? 700 : 400,
+            color: hubTab === id ? C.t1 : C.t2, border: "none", borderBottom: `2px solid ${hubTab === id ? C.purple : "transparent"}`,
+            background: "transparent", borderRadius: 0,
+          }}>{label}</Btn>
+        ))}
+      </div>
+
+      {hubTab === "shield" ? (
+        <SecurityShieldPanel
+          shieldedFiles={shieldedFiles || {}}
+          securityLog={securityLog || []}
+          onProtect={onShieldProtect}
+          onUnprotect={onShieldUnprotect}
+          hubClients={hubClients}
+        />
+      ) : (
       <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
 
       {/* ── Left panel: editor list ── */}
@@ -1611,6 +2071,11 @@ function HubPanel({ hubClients, activeHubId, setActiveHubId, hubStreaming, onSen
                     </div>
                   )}
                 </div>
+                {active.file && (
+                  <Btn onClick={() => onBugScan(active.id)} disabled={bugReports?.[active.id]?.scanning} style={{ padding: "4px 10px", fontSize: 11, background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 6, color: C.red, display: "flex", alignItems: "center", gap: 4 }}>
+                    {bugReports?.[active.id]?.scanning ? <><Spinner /> Scanning…</> : "🐛 Scan"}
+                  </Btn>
+                )}
               </div>
 
               {/* Selected code preview */}
@@ -1621,6 +2086,15 @@ function HubPanel({ hubClients, activeHubId, setActiveHubId, hubStreaming, onSen
                 </div>
               )}
             </div>
+
+            {/* Bug Report Card */}
+            {active && (
+              <BugReportCard
+                report={bugReports?.[active.id]}
+                scanning={bugReports?.[active.id]?.scanning}
+                onRescan={() => onBugScan(active.id)}
+              />
+            )}
 
             {/* Chat messages */}
             <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
@@ -1698,6 +2172,7 @@ function HubPanel({ hubClients, activeHubId, setActiveHubId, hubStreaming, onSen
         )}
       </div>
     </div>
+      )}
     </div>
   );
 }
@@ -2106,21 +2581,29 @@ For each section, suggest 2-3 types of sources to look for (e.g. "longitudinal s
         label: "SWOT Analysis",
         icon: "🎯",
         hint: "Strengths, Weaknesses, Opportunities, Threats",
-        prompt: `Perform a SWOT analysis for: [TOPIC] (e.g. "a new coffee shop in a university campus")
+        prompt: `Perform a detailed SWOT analysis for: [TOPIC]
 
-| | Strengths | Weaknesses |
-|-|-----------|------------|
-| **Internal** | • [S1] | • [W1] |
-| | • [S2] | • [W2] |
-| | • [S3] | • [W3] |
+**STRENGTHS (Internal — what the business does well):**
+1.
+2.
+3.
 
-| | Opportunities | Threats |
-|-|---------------|---------|
-| **External** | • [O1] | • [T1] |
-| | • [O2] | • [T2] |
-| | • [O3] | • [T3] |
+**WEAKNESSES (Internal — areas that need improvement):**
+1.
+2.
+3.
 
-**Strategic Insights:**
+**OPPORTUNITIES (External — favorable conditions to exploit):**
+1.
+2.
+3.
+
+**THREATS (External — risks or challenges to address):**
+1.
+2.
+3.
+
+**STRATEGIC INSIGHTS:**
 - SO Strategy (use strengths to exploit opportunities):
 - WO Strategy (overcome weaknesses using opportunities):
 - ST Strategy (use strengths to counter threats):
@@ -2279,746 +2762,6 @@ Highlight your top 5 picks with ⭐`,
   },
 ];
 
-// ─── Financial Analyst ────────────────────────────────────────────────────────
-
-// Known financial field keywords — handles messy real-world labels
-const FIN_FIELDS = {
-  revenue:       ["revenue", "net revenue", "sales", "turnover", "income from operations", "total income", "gross revenue", "net sales"],
-  grossProfit:   ["gross profit", "gross income"],
-  ebitda:        ["ebitda", "operating profit", "ebit", "operating income", "profit before interest and tax", "pbit"],
-  netProfit:     ["net profit", "net income", "profit after tax", "pat", "profit for the year", "net earnings", "profit after taxation"],
-  cashFlow:      ["cash flow from operations", "operating cash flow", "fcf", "free cash flow", "net cash from operating", "cash generated from operations"],
-  totalAssets:   ["total assets"],
-  totalLiab:     ["total liabilities", "total debt", "total borrowings", "total liab"],
-  currentAssets: ["current assets", "total current assets"],
-  currentLiab:   ["current liabilities", "total current liabilities"],
-  equity:        ["total equity", "shareholders equity", "shareholders fund", "net worth", "stockholders equity", "owners equity"],
-  inventory:     ["inventory", "inventories", "stock"],
-  cash:          ["cash and cash equivalents", "cash and equivalents", "cash at bank"],
-};
-
-// Fuzzy-match a cell label string against known field keywords
-function matchField(label) {
-  if (!label) return null;
-  const l = String(label).toLowerCase().trim();
-  for (const [key, keywords] of Object.entries(FIN_FIELDS)) {
-    for (const kw of keywords) {
-      if (l === kw || l.startsWith(kw) || l.includes(kw)) return key;
-    }
-  }
-  return null;
-}
-
-// Parse a value from a JSON cell (number, string with commas, etc.)
-function toNum(v) {
-  if (v === null || v === undefined) return null;
-  if (typeof v === "number") return v;
-  const s = String(v).replace(/[,\s₹$£€]/g, "").replace(/[()]/g, m => m === "(" ? "-" : "");
-  const n = parseFloat(s);
-  return isNaN(n) ? null : n;
-}
-
-// Format a number as currency with K/M/B suffix
-function fmtCurrency(n, prefix = "") {
-  if (n === null || n === undefined || isNaN(n)) return "N/A";
-  const abs = Math.abs(n);
-  if (abs >= 1e9)  return (n < 0 ? "-" : "") + prefix + (abs / 1e9).toFixed(1) + "B";
-  if (abs >= 1e6)  return (n < 0 ? "-" : "") + prefix + (abs / 1e6).toFixed(1) + "M";
-  if (abs >= 1e3)  return (n < 0 ? "-" : "") + prefix + (abs / 1e3).toFixed(1) + "K";
-  return (n < 0 ? "-" : "") + prefix + abs.toFixed(0);
-}
-
-function fmtPct(n) {
-  if (n === null || isNaN(n)) return "N/A";
-  return (n >= 0 ? "+" : "") + n.toFixed(1) + "%";
-}
-
-/**
- * Detect financial fields from a sheet's rows.
- * Handles two orientations:
- *   ROW-ORIENTED (most common): Row 0 = headers/periods, Col 0 = row label, Col 1+ = values per period
- *   COL-ORIENTED (transposed):  Col 0 = period, Row 0 = field labels, cells = values
- * Returns: { periods: string[], fields: { [fieldKey]: number[] } }
- */
-function detectFinancialRows(rows) {
-  if (!rows || rows.length < 2) return { periods: [], fields: {} };
-
-  // ── Attempt ROW-ORIENTED: first row = period headers, first col = labels ──
-  const headerRow = rows[0];
-  // Periods are columns 1..N in the header row
-  const rawPeriods = headerRow.slice(1).map(v => v != null ? String(v).trim() : "").filter(Boolean);
-
-  const fields = {};
-  let matchCount = 0;
-
-  for (let r = 1; r < rows.length; r++) {
-    const row = rows[r];
-    const label = row[0] != null ? String(row[0]).trim() : "";
-    const key = matchField(label);
-    if (!key) continue;
-    // Extract numeric values from col 1 onward (aligned with rawPeriods)
-    const vals = rawPeriods.map((_, i) => toNum(row[i + 1]));
-    if (vals.some(v => v !== null)) {
-      fields[key] = vals;
-      matchCount++;
-    }
-  }
-
-  if (matchCount >= 2) {
-    return { periods: rawPeriods, fields };
-  }
-
-  // ── Attempt COL-ORIENTED: first col = row labels, first row = field labels ──
-  const colFields = {};
-  let colMatchCount = 0;
-  const colLabels = headerRow.map(v => v != null ? String(v).trim() : "");
-  const colPeriods = rows.slice(1).map(r => r[0] != null ? String(r[0]).trim() : "");
-
-  for (let c = 1; c < colLabels.length; c++) {
-    const key = matchField(colLabels[c]);
-    if (!key) continue;
-    const vals = rows.slice(1).map(r => toNum(r[c]));
-    if (vals.some(v => v !== null)) {
-      colFields[key] = vals;
-      colMatchCount++;
-    }
-  }
-
-  if (colMatchCount >= 2) {
-    return { periods: colPeriods, fields: colFields };
-  }
-
-  // ── Last resort: scan all rows for labels anywhere ──
-  const scanFields = {};
-  let scanPeriods = rawPeriods.length ? rawPeriods : [];
-  for (let r = 0; r < rows.length; r++) {
-    const row = rows[r];
-    for (let c = 0; c < row.length; c++) {
-      const key = matchField(row[c] != null ? String(row[c]) : "");
-      if (!key) continue;
-      const vals = row.slice(c + 1).map(toNum).filter(v => v !== null);
-      if (vals.length > 0 && !scanFields[key]) {
-        scanFields[key] = vals;
-        if (scanPeriods.length < vals.length) {
-          scanPeriods = Array.from({ length: vals.length }, (_, i) => `Period ${i + 1}`);
-        }
-      }
-    }
-  }
-  return { periods: scanPeriods, fields: scanFields };
-}
-
-// YoY growth % between last two values
-function yoy(arr) {
-  if (!arr || arr.length < 2) return null;
-  const prev = arr[arr.length - 2], curr = arr[arr.length - 1];
-  if (!prev || !curr) return null;
-  return ((curr - prev) / Math.abs(prev)) * 100;
-}
-
-// Valuation engine
-function calcDCF(fcf, g, wacc, tg) {
-  if (!fcf || wacc <= tg) return null;
-  let npv = 0;
-  for (let i = 1; i <= 5; i++) npv += (fcf * Math.pow(1 + g, i)) / Math.pow(1 + wacc, i);
-  const tv = (fcf * Math.pow(1 + g, 5) * (1 + tg)) / (wacc - tg);
-  return npv + tv / Math.pow(1 + wacc, 5);
-}
-
-function calcValuation(fields, opts) {
-  const rev    = fields.revenue?.at(-1)    || 0;
-  const ebitda = fields.ebitda?.at(-1)     || 0;
-  const np     = fields.netProfit?.at(-1)  || 0;
-  const fcf    = fields.cashFlow?.at(-1)   || 0;
-  const dcf    = calcDCF(fcf, opts.growthRate, opts.wacc, opts.terminalGrowth);
-  return {
-    dcf:       dcf,
-    pe:        np   * opts.peMultiple,
-    evEbitda:  ebitda * opts.evMultiple,
-    revMult:   rev  * opts.revMultiple,
-  };
-}
-
-function calcRisk(fields) {
-  const safe = (k) => fields[k]?.at(-1) || 0;
-  const ta   = safe("totalAssets")   || 1;
-  const ca   = safe("currentAssets");
-  const cl   = safe("currentLiab")   || 1;
-  const inv  = safe("inventory");
-  const eq   = safe("equity")        || 1;
-  const tl   = safe("totalLiab");
-  const np   = safe("netProfit");
-  const rev  = safe("revenue")       || 1;
-  const ebit = safe("ebitda");
-  const wc   = ca - cl;
-  const z    = 0.717 * (wc / ta) + 0.847 * (np / ta) + 3.107 * (ebit / ta) + 0.420 * (eq / (tl || 1)) + 0.998 * (rev / ta);
-  return {
-    de:  tl  / eq,
-    cr:  ca  / cl,
-    qr:  (ca - inv) / cl,
-    npm: (np / rev) * 100,
-    z:   isFinite(z) ? z : null,
-  };
-}
-
-// Chart.js canvas hook
-function useChart(ref, config, deps) {
-  useEffect(() => {
-    if (!ref.current) return;
-    const existing = Chart.getChart(ref.current);
-    if (existing) existing.destroy();
-    if (!config) return;
-    new Chart(ref.current, config);
-  }, deps); // eslint-disable-line react-hooks/exhaustive-deps
-}
-
-const CHART_DEFAULTS = {
-  plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => " " + fmtCurrency(ctx.parsed.y) } } },
-  scales: {
-    x: { grid: { color: "rgba(255,255,255,0.04)" }, ticks: { color: "#7a90a8", font: { size: 10 } } },
-    y: { grid: { color: "rgba(255,255,255,0.04)" }, ticks: { color: "#7a90a8", font: { size: 10 } } },
-  },
-  responsive: true, maintainAspectRatio: false,
-};
-
-// ── FinancialAnalystPanel ──────────────────────────────────────────────────────
-function FinancialAnalystPanel({
-  workbooks, setWorkbooks, activeWb, setActiveWb,
-  activeSheet, setActiveSheet, messages, setMessages,
-  input, setInput, streaming, setStreaming,
-  loading, setLoading, streamRef, bufRef, activeModelId,
-}) {
-  // Valuation multiplier inputs
-  const [valOpts, setValOpts] = useState({ growthRate: 0.1, wacc: 0.12, terminalGrowth: 0.02, peMultiple: 15, evMultiple: 10, revMultiple: 2 });
-  const chatBottomRef = useRef(null);
-  const finInputRef   = useRef(null);
-
-  // Chart canvas refs
-  const revChartRef    = useRef(null);
-  const marginChartRef = useRef(null);
-  const cfChartRef     = useRef(null);
-
-  // Active workbook & sheet data
-  const wb    = workbooks.find(w => w.file === activeWb) || workbooks[0];
-  const sheet = wb?.sheets?.find(s => s.name === activeSheet) || wb?.sheets?.[0];
-  const finData = sheet ? detectFinancialRows(sheet.rows) : { periods: [], fields: {} };
-  const { periods, fields } = finData;
-  const hasFinData = Object.keys(fields).length >= 2;
-
-  // Valuation & risk
-  const valuation = hasFinData ? calcValuation(fields, valOpts) : null;
-  const risk      = hasFinData ? calcRisk(fields) : null;
-
-  // Scroll chat to bottom
-  useEffect(() => { chatBottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
-
-  // Set defaults when workbooks change
-  useEffect(() => {
-    if (workbooks.length > 0 && !activeWb) {
-      setActiveWb(workbooks[0].file);
-      setActiveSheet(workbooks[0].sheets?.[0]?.name || null);
-    }
-  }, [workbooks]); // eslint-disable-line
-
-  // Revenue trend chart
-  useChart(revChartRef, periods.length && fields.revenue ? {
-    type: "line",
-    data: {
-      labels: periods,
-      datasets: [{ data: fields.revenue, borderColor: "#3b82f6", backgroundColor: "rgba(59,130,246,0.12)", fill: true, tension: 0.4, pointRadius: 4, pointBackgroundColor: "#3b82f6" }],
-    },
-    options: { ...CHART_DEFAULTS, plugins: { ...CHART_DEFAULTS.plugins, tooltip: { callbacks: { label: ctx => " " + fmtCurrency(ctx.parsed.y) } } } },
-  } : null, [periods.join(), JSON.stringify(fields.revenue)]);
-
-  // Profit margin chart
-  const marginData = periods.map((_, i) => {
-    const r = fields.revenue?.[i], p = fields.netProfit?.[i];
-    return (r && p) ? (p / r * 100) : null;
-  });
-  useChart(marginChartRef, periods.length && marginData.some(v => v !== null) ? {
-    type: "bar",
-    data: {
-      labels: periods,
-      datasets: [{ data: marginData, backgroundColor: marginData.map(v => v >= 0 ? "rgba(34,197,94,0.7)" : "rgba(239,68,68,0.7)"), borderRadius: 4 }],
-    },
-    options: { ...CHART_DEFAULTS, plugins: { ...CHART_DEFAULTS.plugins, tooltip: { callbacks: { label: ctx => " " + (ctx.parsed.y?.toFixed(1) || "N/A") + "%" } } } },
-  } : null, [periods.join(), JSON.stringify(fields.netProfit), JSON.stringify(fields.revenue)]);
-
-  // Cash flow chart
-  useChart(cfChartRef, periods.length && fields.cashFlow ? {
-    type: "bar",
-    data: {
-      labels: periods,
-      datasets: [{ data: fields.cashFlow, backgroundColor: fields.cashFlow.map(v => (v || 0) >= 0 ? "rgba(56,189,248,0.7)" : "rgba(239,68,68,0.7)"), borderRadius: 4 }],
-    },
-    options: { ...CHART_DEFAULTS },
-  } : null, [periods.join(), JSON.stringify(fields.cashFlow)]);
-
-  // Link workbook(s)
-  async function linkWorkbooks() {
-    setLoading(true);
-    try {
-      const paths = await open({ multiple: true, filters: [{ name: "Excel Workbook", extensions: ["xlsx", "xls", "xlsm"] }] });
-      if (!paths) return;
-      const pathArr = Array.isArray(paths) ? paths : [paths];
-      // Filter already-loaded paths
-      const existing = new Set(workbooks.map(w => w.path));
-      const newPaths = pathArr.filter(p => !existing.has(p));
-      if (!newPaths.length) return;
-      const result = await invoke("read_excel_multi", { paths: newPaths });
-      const newWbs = result.workbooks || [];
-      setWorkbooks(prev => {
-        const merged = [...prev, ...newWbs];
-        if (!activeWb && merged.length > 0) {
-          setActiveWb(merged[0].file);
-          setActiveSheet(merged[0].sheets?.[0]?.name || null);
-        }
-        return merged;
-      });
-    } catch (e) {
-      console.error("[finance] link workbooks:", e);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function removeWorkbook(file) {
-    setWorkbooks(prev => {
-      const next = prev.filter(w => w.file !== file);
-      if (activeWb === file) {
-        setActiveWb(next[0]?.file || null);
-        setActiveSheet(next[0]?.sheets?.[0]?.name || null);
-      }
-      return next;
-    });
-  }
-
-  // Build AI context from ALL linked workbooks (compact but complete)
-  function buildFinContext() {
-    return workbooks.map(w =>
-      `=== Workbook: ${w.file} ===\n` +
-      w.sheets.map(sh => {
-        // Send full sheet data (all rows, all columns), truncated to 300 rows per sheet
-        const dataRows = sh.rows.slice(0, 300);
-        const formatted = dataRows.map(row =>
-          row.map(v => v === null || v === undefined ? "" : String(v)).join(" | ")
-        ).join("\n");
-        return `--- Sheet: ${sh.name} ---\n${formatted}`;
-      }).join("\n")
-    ).join("\n\n");
-  }
-
-  // Send AI message
-  async function sendFinMsg() {
-    const text = input.trim();
-    if (!text || !activeModelId || streaming) return;
-    const userMsg = { id: Date.now(), role: "user", text };
-    const aiId   = Date.now() + 1;
-    const aiMsg  = { id: aiId, role: "ai", text: "", streaming: true };
-    setMessages(prev => [...prev, userMsg, aiMsg]);
-    setInput("");
-    setStreaming(true);
-    streamRef.current = aiId;
-    bufRef.current    = "";
-
-    const ctx     = buildFinContext();
-    const history = messages.slice(-6).map(m => `${m.role === "user" ? "User" : "AI"}: ${m.text}`).join("\n");
-    const prompt  = `You are an expert financial analyst. Analyse the workbook data provided and answer the question accurately. Show calculations when relevant.\n\nWORKBOOK DATA:\n${ctx}\n\nCONVERSATION HISTORY:\n${history}\n\nUser: ${text}\nAI:`;
-
-    const unlisten = await listen("llm-token", e => {
-      if (streamRef.current !== aiId) return;
-      bufRef.current += e.payload;
-      setMessages(prev => prev.map(m => m.id === aiId ? { ...m, text: bufRef.current } : m));
-    });
-    const unlistenDone = await listen("llm-done", () => {
-      setMessages(prev => prev.map(m => m.id === aiId ? { ...m, streaming: false } : m));
-      setStreaming(false);
-      streamRef.current = null;
-      unlisten(); unlistenDone();
-    });
-
-    try {
-      await invoke("generate", { prompt, maxTokens: 2048, temperature: 0.3 });
-    } catch (e) {
-      setMessages(prev => prev.map(m => m.id === aiId ? { ...m, text: "Error: " + e, streaming: false } : m));
-      setStreaming(false);
-      unlisten(); unlistenDone();
-    }
-  }
-
-  // Risk badge helper
-  function riskBadge(val, thresholds, inverted = false) {
-    if (val === null || isNaN(val)) return { color: C.t3, label: "N/A", icon: "—" };
-    const [green, amber] = inverted ? [thresholds[1], thresholds[0]] : thresholds;
-    if (!inverted ? val >= green : val <= green) return { color: C.green, label: "Healthy", icon: "✅" };
-    if (!inverted ? val >= amber : val <= amber) return { color: C.amber, label: "Warning", icon: "⚠️" };
-    return { color: C.red, label: "Risk", icon: "❌" };
-  }
-
-  const KPI_DEFS = [
-    { key: "revenue",    label: "Revenue",      color: C.blue  },
-    { key: "netProfit",  label: "Net Profit",   color: C.green },
-    { key: "ebitda",     label: "EBITDA",       color: C.cyan  },
-    { key: "cashFlow",   label: "Cash Flow",    color: C.amber },
-    { key: "grossProfit",label: "Gross Profit", color: C.purple},
-  ].filter(d => fields[d.key]);
-
-  return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: C.bgDeep }}>
-      {/* ── Header ── */}
-      <div style={{ padding: "12px 20px", borderBottom: `1px solid ${C.border}`, background: C.bgPanel, display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
-        <Icon d={IC.chart} size={16} stroke={C.green} />
-        <span style={{ fontSize: 14, fontWeight: 700, color: C.t1 }}>Financial Analyst</span>
-        {workbooks.length > 0 && <span style={{ fontSize: 11, color: C.t3 }}>{workbooks.length} workbook{workbooks.length > 1 ? "s" : ""} linked</span>}
-        <div style={{ flex: 1 }} />
-        {/* Workbook tabs */}
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", maxWidth: "60%" }}>
-          {workbooks.map(w => (
-            <div key={w.file} onClick={() => { setActiveWb(w.file); setActiveSheet(w.sheets?.[0]?.name || null); }}
-              style={{ display: "flex", alignItems: "center", gap: 5, padding: "3px 10px 3px 10px", borderRadius: 20, cursor: "pointer",
-                background: activeWb === w.file ? "rgba(34,197,94,0.15)" : C.bgCard,
-                border: `1px solid ${activeWb === w.file ? C.green : C.border}`,
-                color: activeWb === w.file ? C.green : C.t2, fontSize: 11, fontWeight: 500 }}>
-              📊 {w.file}
-              <span onClick={e => { e.stopPropagation(); removeWorkbook(w.file); }}
-                style={{ marginLeft: 2, color: C.t3, cursor: "pointer", fontSize: 10 }}>✕</span>
-            </div>
-          ))}
-        </div>
-        <Btn onClick={linkWorkbooks} disabled={loading} style={{
-          padding: "6px 14px", background: C.green, border: "none", borderRadius: 8,
-          color: "#fff", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
-          {loading ? <Spinner /> : <Icon d={IC.plus} size={12} />}
-          {loading ? "Loading…" : "Link Workbook"}
-        </Btn>
-      </div>
-
-      {/* ── Sheet selector ── */}
-      {wb && wb.sheets.length > 1 && (
-        <div style={{ padding: "6px 20px", borderBottom: `1px solid ${C.border}`, background: C.bgPanel, display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {wb.sheets.map(sh => (
-            <Btn key={sh.name} onClick={() => setActiveSheet(sh.name)} style={{
-              padding: "3px 12px", borderRadius: 20, fontSize: 11, fontWeight: 500,
-              background: activeSheet === sh.name ? "rgba(59,130,246,0.15)" : C.bgCard,
-              border: `1px solid ${activeSheet === sh.name ? C.blue : C.border}`,
-              color: activeSheet === sh.name ? C.blue : C.t2 }}>
-              {sh.name}
-            </Btn>
-          ))}
-        </div>
-      )}
-
-      {/* ── No workbooks empty state ── */}
-      {workbooks.length === 0 && (
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16 }}>
-          <div style={{ fontSize: 48 }}>📊</div>
-          <div style={{ fontSize: 16, fontWeight: 600, color: C.t1 }}>Financial Analyst</div>
-          <div style={{ fontSize: 13, color: C.t2, textAlign: "center", maxWidth: 400 }}>
-            Link one or more Excel workbooks (P&L, Balance Sheet, Cash Flow) to get started.<br/>
-            The AI will analyse your data and provide valuation, risk metrics, and insights.
-          </div>
-          <Btn onClick={linkWorkbooks} disabled={loading} style={{
-            padding: "10px 24px", background: C.green, border: "none", borderRadius: 10,
-            color: "#fff", fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
-            {loading ? <Spinner /> : <Icon d={IC.plus} size={14} />}
-            {loading ? "Loading…" : "Link Workbook"}
-          </Btn>
-        </div>
-      )}
-
-      {/* ── Main two-column layout ── */}
-      {workbooks.length > 0 && (
-        <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
-
-          {/* LEFT — Dashboard (60%) */}
-          <div style={{ flex: "0 0 60%", overflowY: "auto", padding: "16px 20px", borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", gap: 16 }}>
-
-            {/* No financial data detected */}
-            {!hasFinData && (
-              <div style={{ padding: 20, background: "rgba(245,158,11,0.08)", border: `1px solid rgba(245,158,11,0.25)`, borderRadius: 12, display: "flex", gap: 12 }}>
-                <Icon d={IC.warning} size={18} stroke={C.amber} />
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: C.amber }}>No financial fields detected</div>
-                  <div style={{ fontSize: 12, color: C.t2, marginTop: 4 }}>
-                    The selected sheet doesn't have recognisable financial labels (Revenue, EBITDA, Net Profit, etc.).
-                    Try a different sheet, or use the AI chat to ask questions about your data.
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Raw data preview (always shown) */}
-            {sheet && (
-              <div>
-                <div style={{ fontSize: 11, fontWeight: 600, color: C.t3, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>
-                  Sheet Preview — {sheet.name} ({sheet.rows.length} rows × {Math.max(...sheet.rows.map(r => r.length), 0)} cols)
-                </div>
-                <div style={{ overflowX: "auto", borderRadius: 10, border: `1px solid ${C.border}` }}>
-                  <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11 }}>
-                    <tbody>
-                      {sheet.rows.slice(0, 10).map((row, ri) => (
-                        <tr key={ri} style={{ background: ri === 0 ? C.bgCard : "transparent", borderBottom: `1px solid ${C.border}` }}>
-                          {row.slice(0, 10).map((cell, ci) => (
-                            <td key={ci} style={{ padding: "5px 10px", color: ri === 0 ? C.t1 : C.t2, fontWeight: ri === 0 ? 600 : 400, whiteSpace: "nowrap", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis" }}>
-                              {cell === null || cell === undefined ? "" : String(cell)}
-                            </td>
-                          ))}
-                          {row.length > 10 && <td style={{ padding: "5px 10px", color: C.t3, fontSize: 10 }}>+{row.length - 10} more</td>}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  {sheet.rows.length > 10 && <div style={{ padding: "6px 10px", fontSize: 10, color: C.t3 }}>Showing first 10 of {sheet.rows.length} rows</div>}
-                </div>
-              </div>
-            )}
-
-            {hasFinData && <>
-
-              {/* KPI Cards */}
-              <div>
-                <div style={{ fontSize: 11, fontWeight: 600, color: C.t3, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Key Metrics — {periods.at(-1) || "Latest"}</div>
-                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                  {KPI_DEFS.map(({ key, label, color }) => {
-                    const vals = fields[key];
-                    const latest = vals?.at(-1);
-                    const growth = yoy(vals);
-                    return (
-                      <div key={key} style={{ flex: "1 1 130px", padding: "12px 14px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12, minWidth: 120 }}>
-                        <div style={{ fontSize: 10, color: C.t3, marginBottom: 4 }}>{label}</div>
-                        <div style={{ fontSize: 18, fontWeight: 700, color, marginBottom: 3 }}>{fmtCurrency(latest)}</div>
-                        {growth !== null && (
-                          <div style={{ fontSize: 10, color: growth >= 0 ? C.green : C.red }}>
-                            {growth >= 0 ? "▲" : "▼"} {Math.abs(growth).toFixed(1)}% YoY
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Charts row */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                {/* Revenue Trend */}
-                {fields.revenue && (
-                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>📈 Revenue Trend</div>
-                    <div style={{ height: 140, position: "relative" }}><canvas ref={revChartRef} /></div>
-                  </div>
-                )}
-                {/* Profit Margin */}
-                {fields.netProfit && fields.revenue && (
-                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>💹 Net Profit Margin %</div>
-                    <div style={{ height: 140, position: "relative" }}><canvas ref={marginChartRef} /></div>
-                  </div>
-                )}
-                {/* Cash Flow */}
-                {fields.cashFlow && (
-                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>💰 Cash Flow</div>
-                    <div style={{ height: 140, position: "relative" }}><canvas ref={cfChartRef} /></div>
-                  </div>
-                )}
-                {/* EBITDA Bar */}
-                {fields.ebitda && (
-                  <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: C.t2, marginBottom: 10 }}>📊 EBITDA</div>
-                    <div style={{ height: 140, position: "relative" }}>
-                      <_EbitdaChart periods={periods} data={fields.ebitda} />
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Valuation + Risk side by side */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-
-                {/* Valuation */}
-                <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: C.cyan, marginBottom: 10 }}>🏷️ Valuation Estimates</div>
-                  {[
-                    { label: "DCF Valuation",     val: valuation?.dcf,      color: C.blue },
-                    { label: `P/E × ${valOpts.peMultiple}`,    val: valuation?.pe,       color: C.green },
-                    { label: `EV/EBITDA × ${valOpts.evMultiple}`, val: valuation?.evEbitda, color: C.cyan },
-                    { label: `Rev × ${valOpts.revMultiple}x`,     val: valuation?.revMult,  color: C.purple },
-                  ].map(({ label, val, color }) => (
-                    <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                      <span style={{ fontSize: 11, color: C.t2 }}>{label}</span>
-                      <span style={{ fontSize: 13, fontWeight: 700, color }}>{fmtCurrency(val)}</span>
-                    </div>
-                  ))}
-                  {/* Multiplier inputs */}
-                  <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 8, paddingTop: 8 }}>
-                    <div style={{ fontSize: 10, color: C.t3, marginBottom: 6 }}>Adjust multiples:</div>
-                    {[
-                      { label: "Growth %", key: "growthRate",      factor: 100, suffix: "%" },
-                      { label: "WACC %",   key: "wacc",            factor: 100, suffix: "%" },
-                      { label: "P/E",      key: "peMultiple",      factor: 1,   suffix: "×" },
-                      { label: "EV/EBITDA",key: "evMultiple",      factor: 1,   suffix: "×" },
-                    ].map(({ label, key, factor, suffix }) => (
-                      <div key={key} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-                        <span style={{ fontSize: 10, color: C.t2, width: 70 }}>{label}</span>
-                        <input type="number" value={(valOpts[key] * factor).toFixed(factor === 100 ? 1 : 0)}
-                          onChange={e => setValOpts(o => ({ ...o, [key]: parseFloat(e.target.value || 0) / factor }))}
-                          style={{ width: 60, background: C.bgPanel, border: `1px solid ${C.border}`, borderRadius: 5, color: C.t1, fontSize: 11, padding: "2px 6px" }} />
-                        <span style={{ fontSize: 10, color: C.t3 }}>{suffix}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Risk Analysis */}
-                <div style={{ padding: 14, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: C.red, marginBottom: 10 }}>⚠️ Risk Analysis</div>
-                  {[
-                    { label: "Debt / Equity",     val: risk?.de,  fmt: v => v?.toFixed(2), thresh: [1.0, 2.0], inv: true },
-                    { label: "Current Ratio",     val: risk?.cr,  fmt: v => v?.toFixed(2), thresh: [1.5, 1.0], inv: false },
-                    { label: "Quick Ratio",       val: risk?.qr,  fmt: v => v?.toFixed(2), thresh: [1.0, 0.7], inv: false },
-                    { label: "Net Profit Margin", val: risk?.npm, fmt: v => v?.toFixed(1) + "%", thresh: [10, 5], inv: false },
-                    { label: "Altman Z-Score",    val: risk?.z,   fmt: v => v?.toFixed(2), thresh: [2.99, 1.81], inv: false },
-                  ].map(({ label, val, fmt, thresh, inv }) => {
-                    const badge = riskBadge(val, thresh, inv);
-                    return (
-                      <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 9 }}>
-                        <span style={{ fontSize: 11, color: C.t2 }}>{label}</span>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={{ fontSize: 12, fontWeight: 700, color: badge.color }}>{val !== null && !isNaN(val) ? fmt(val) : "N/A"}</span>
-                          <span style={{ fontSize: 12 }}>{badge.icon}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                  <div style={{ marginTop: 8, padding: "8px", background: C.bgPanel, borderRadius: 8, fontSize: 10, color: C.t3 }}>
-                    Z &gt; 2.99 safe · 1.81–2.99 grey zone · &lt; 1.81 distress
-                  </div>
-                </div>
-
-              </div>
-
-              {/* Multi-period comparison table */}
-              {periods.length > 1 && (
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: C.t3, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8 }}>Period Comparison</div>
-                  <div style={{ overflowX: "auto", borderRadius: 10, border: `1px solid ${C.border}` }}>
-                    <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 11 }}>
-                      <thead>
-                        <tr style={{ background: C.bgCard }}>
-                          <th style={{ padding: "7px 12px", textAlign: "left", color: C.t2, fontWeight: 600 }}>Metric</th>
-                          {periods.map(p => <th key={p} style={{ padding: "7px 12px", textAlign: "right", color: C.t2, fontWeight: 600 }}>{p}</th>)}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {Object.entries(fields).map(([key, vals]) => (
-                          <tr key={key} style={{ borderTop: `1px solid ${C.border}` }}>
-                            <td style={{ padding: "6px 12px", color: C.t1, fontWeight: 500 }}>{key.replace(/([A-Z])/g, " $1").trim()}</td>
-                            {periods.map((_, i) => (
-                              <td key={i} style={{ padding: "6px 12px", textAlign: "right", color: C.cyan }}>{fmtCurrency(vals[i])}</td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-            </>}
-          </div>
-
-          {/* RIGHT — AI Chat (40%) */}
-          <div style={{ flex: "0 0 40%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-            <div style={{ padding: "10px 16px", borderBottom: `1px solid ${C.border}`, background: C.bgPanel }}>
-              <span style={{ fontSize: 12, fontWeight: 600, color: C.t1 }}>🤖 AI Financial Analyst</span>
-              <div style={{ fontSize: 10, color: C.t3, marginTop: 2 }}>Ask questions about your workbook data</div>
-            </div>
-
-            {/* Messages */}
-            <div style={{ flex: 1, overflowY: "auto", padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
-              {messages.length === 0 && (
-                <div style={{ textAlign: "center", paddingTop: 30 }}>
-                  <div style={{ fontSize: 28, marginBottom: 8 }}>💬</div>
-                  <div style={{ fontSize: 12, color: C.t3 }}>
-                    {workbooks.length === 0
-                      ? "Link a workbook first, then ask me anything about your financial data."
-                      : "Ask me anything about your financial data.\n\nTry: \"What was our revenue growth?\", \"Calculate valuation\", \"Identify risks\""}
-                  </div>
-                  {/* Quick starter prompts */}
-                  {workbooks.length > 0 && (
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center", marginTop: 14 }}>
-                      {["Summarise financial performance", "What are the key risks?", "Calculate EBITDA margin trend", "Compare periods"].map(p => (
-                        <Btn key={p} onClick={() => { setInput(p); finInputRef.current?.focus(); }}
-                          style={{ padding: "5px 11px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 20, color: C.t2, fontSize: 10.5 }}>
-                          {p}
-                        </Btn>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              {messages.map(msg => (
-                <div key={msg.id} style={{
-                  padding: "9px 12px",
-                  background: msg.role === "user" ? C.bgCard : "rgba(34,197,94,0.06)",
-                  border: `1px solid ${msg.role === "user" ? C.border : "rgba(34,197,94,0.2)"}`,
-                  borderRadius: msg.role === "user" ? "14px 4px 14px 14px" : "4px 14px 14px 14px",
-                  alignSelf: msg.role === "user" ? "flex-end" : "flex-start",
-                  maxWidth: "90%", fontSize: 12.5, color: C.t2, lineHeight: 1.65,
-                  whiteSpace: "pre-wrap", wordBreak: "break-word",
-                }}>
-                  {msg.text || (msg.streaming ? <Typing /> : "")}
-                </div>
-              ))}
-              <div ref={chatBottomRef} />
-            </div>
-
-            {/* Input */}
-            <div style={{ padding: "10px 14px 14px", background: C.bgPanel, borderTop: `1px solid ${C.border}` }}>
-              <div style={{ display: "flex", gap: 8, alignItems: "flex-end", padding: "8px 12px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 12 }}>
-                <textarea
-                  ref={finInputRef}
-                  value={input}
-                  onChange={e => setInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFinMsg(); } }}
-                  placeholder={activeModelId ? "Ask about your financial data…" : "Load a model first to chat"}
-                  rows={1}
-                  style={{ flex: 1, background: "none", border: "none", color: C.t1, fontSize: 12.5, lineHeight: 1.6, maxHeight: 100, overflowY: "auto", fontFamily: "inherit", resize: "none" }}
-                />
-                <Btn onClick={sendFinMsg} disabled={!input.trim() || !activeModelId || streaming} style={{
-                  width: 32, height: 32, borderRadius: 8, border: "none", flexShrink: 0,
-                  background: input.trim() && activeModelId ? C.green : C.bgPanel,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  color: input.trim() && activeModelId ? "#fff" : C.t3 }}>
-                  <Icon d={IC.send} size={13} />
-                </Btn>
-              </div>
-              <div style={{ marginTop: 5, fontSize: 10, color: C.t3, textAlign: "center" }}>
-                All {workbooks.length > 0 ? workbooks.reduce((a, w) => a + w.sheets.length, 0) + " sheets from " + workbooks.length + " workbook(s)" : "workbook data"} sent as context
-              </div>
-            </div>
-          </div>
-
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Standalone EBITDA chart (separate ref to avoid collisions)
-function _EbitdaChart({ periods, data }) {
-  const ref = useRef(null);
-  useChart(ref, periods.length && data ? {
-    type: "bar",
-    data: {
-      labels: periods,
-      datasets: [{ data, backgroundColor: "rgba(168,85,247,0.7)", borderRadius: 4 }],
-    },
-    options: { ...CHART_DEFAULTS },
-  } : null, [periods.join(), JSON.stringify(data)]);
-  return <canvas ref={ref} />;
-}
-
 // ─── Template Panel Component ─────────────────────────────────────────────────
 function TemplatePanel({ onSelect, onClose }) {
   const [activeCategory, setActiveCategory] = useState("education");
@@ -3152,20 +2895,11 @@ function OfflineAIApp() {
   const [input, setInput] = useState("");
   const [showTemplates, setShowTemplates] = useState(false);
   const [streaming, setStreaming] = useState(false);
-  // ── Financial Analyst state ──────────────────────────────────────────────
-  const [showFinance, setShowFinance]         = useState(false);
-  const [finWorkbooks, setFinWorkbooks]       = useState([]); // { file, path, sheets[] }[]
-  const [finActiveWb, setFinActiveWb]         = useState(null);
-  const [finActiveSheet, setFinActiveSheet]   = useState(null);
-  const [finMessages, setFinMessages]         = useState([]);
-  const [finInput, setFinInput]               = useState("");
-  const [finStreaming, setFinStreaming]        = useState(false);
-  const [finLoading, setFinLoading]           = useState(false);
-  const finStreamRef                          = useRef(null); // active stream msg id
-  const finBufRef                             = useRef("");   // streaming buffer
   const [showConn, setShowConn] = useState(false);
   const [showMod, setShowMod] = useState(false);
-  const [connectors, setConnectors] = useState([]);
+  const [connectors, setConnectors] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("connectors") || "[]"); } catch { return []; }
+  });
   const [sSearch, setSSearch] = useState("");
   const [contextMenu, setContextMenu] = useState(null); // null | { chatId, x, y }
   const [renamingId, setRenamingId] = useState(null);   // chatId being renamed
@@ -3173,13 +2907,15 @@ function OfflineAIApp() {
 
   // modelState: { [modelId]: { status: "not-downloaded"|"downloading"|"downloaded"|"loaded"|"error", progress?, error? } }
   const [modelState, setModelState] = useState({});
-  const [activeModelId, setActiveModelId] = useState(null);
+  const [activeModelId, setActiveModelId] = useState(null); // set only after server is ready
   const [modelLoading, setModelLoading] = useState(false);
   const [hfToken, setHfToken] = useState(() => localStorage.getItem("hf_token") || "");
   const [serverReady, setServerReady] = useState(null); // null=checking, true/false
   const [setupProgress, setSetupProgress] = useState(null); // null | { step, downloaded?, total? }
   const [selectedLang, setSelectedLang] = useState("auto"); // language selector
   const [autoDetectedLang, setAutoDetectedLang] = useState("en"); // tracks detected lang in Auto mode
+
+  const [localIP, setLocalIP]           = useState(null);
 
   // ── Extension Hub state (desktop only) ────────────────────────────────────
   // hubClients: { [id]: { id, editor, file, language, selectedCode, cursorLine, messages: [] } }
@@ -3189,12 +2925,63 @@ function OfflineAIApp() {
   const [hubStreaming, setHubStreaming] = useState(false);
   const hubStreamBufRef  = useRef("");
   const hubStreamMsgRef  = useRef(null);   // { clientId, msgId }
-  // Detect desktop once at mount — Hub is hidden on mobile
-  const [isDesktop, setIsDesktop] = useState(true);
+  const [hubBugReports, setHubBugReports] = useState({});
+  // { [clientId]: { scanning: bool, bugs: [], scannedFile: '', scannedAt: null } }
+
+  // ── Security Shield state ─────────────────────────────────────────────────
+  const [shieldedFiles, setShieldedFiles] = useState({});
+  // { [path]: { decoyPath, protectedAt, fileName, fileType } }
+  const [securityLog, setSecurityLog] = useState([]);
+  const [showSecurityLog, setShowSecurityLog] = useState(false);
+
+  // Detect mobile — width-based (reliable, ignores "Request Desktop Site")
+  const [isDesktop, setIsDesktop] = useState(() => window.innerWidth > 768);
+  const [mobileTab, setMobileTab] = useState("chat"); // "chat" | "music" | "games"
+  // LAN AI: desktop IP for mobile browser to connect to
+  const [lanIP, setLanIP]       = useState(() => localStorage.getItem("lan_ip") || "");
+  const [showLanSet, setShowLanSet] = useState(false);
   useEffect(() => {
-    const ua = navigator.userAgent.toLowerCase();
-    setIsDesktop(!/android|iphone|ipad|ipod/.test(ua));
+    const check = () => setIsDesktop(window.innerWidth > 768);
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
   }, []);
+
+  // ── WebLLM — offline AI inside mobile browser via WebGPU ─────────────────
+  // Status: "idle" | "checking" | "downloading" | "loading" | "ready" | "error"
+  const [wllmStatus,   setWllmStatus]   = useState("idle");
+  const [wllmProgress, setWllmProgress] = useState(0);
+  const [wllmMsg,      setWllmMsg]      = useState("");
+  const [wllmModel,    setWllmModel]    = useState(() => localStorage.getItem("wllm_model") || "Qwen2.5-0.5B-Instruct-q4f16_1-MLC");
+  const wllmEngineRef = useRef(null); // holds the loaded MLCEngine instance
+
+  const WLLM_MODELS = [
+    { id: "Qwen2.5-0.5B-Instruct-q4f16_1-MLC",   label: "Qwen2.5 0.5B",  size: "~390 MB", note: "Fastest, good for chat" },
+    { id: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC",   label: "Qwen2.5 1.5B",  size: "~940 MB", note: "Better quality" },
+    { id: "Phi-3.5-mini-instruct-q4f16_1-MLC",    label: "Phi-3.5 Mini",  size: "~2.1 GB", note: "Best quality, needs 3GB RAM" },
+  ];
+
+  const initWebLLM = async (modelId) => {
+    const mid = modelId || wllmModel;
+    setWllmStatus("downloading");
+    setWllmProgress(0);
+    setWllmMsg("Initialising…");
+    try {
+      const engine = await WebLLM.CreateMLCEngine(mid, {
+        initProgressCallback: (p) => {
+          setWllmProgress(Math.round((p.progress || 0) * 100));
+          setWllmMsg(p.text || "Loading…");
+        },
+      });
+      wllmEngineRef.current = engine;
+      localStorage.setItem("wllm_model", mid);
+      setWllmModel(mid);
+      setWllmStatus("ready");
+      setWllmMsg("AI ready — fully offline");
+    } catch (err) {
+      setWllmStatus("error");
+      setWllmMsg(String(err));
+    }
+  };
 
   // ── Hub trial ─────────────────────────────────────────────────────────────
   // trialDaysLeft: null = trial not started yet, ≥1 = active, 0 = expired
@@ -3212,6 +2999,11 @@ function OfflineAIApp() {
   const [updateAvailable, setUpdateAvailable] = useState(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [updateInstalling, setUpdateInstalling] = useState(false);
+
+  // Fetch local IP for mobile QR bridge
+  useEffect(() => {
+    invoke("get_local_ip").then(ip => setLocalIP(ip)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     // Check for updates 4 seconds after launch (so app loads first).
@@ -3344,7 +3136,7 @@ function OfflineAIApp() {
     }
   };
 
-  // ── On mount: check which models are already on disk ──────────────────────
+  // ── On mount: check which models are already on disk + auto-reconnect ──────
   useEffect(() => {
     const check = async () => {
       const updates = {};
@@ -3357,8 +3149,15 @@ function OfflineAIApp() {
         }
       }
       setModelState(updates);
+
+      // Auto-reconnect the last used model if it's still on disk
+      const saved = localStorage.getItem("active_model_id");
+      if (saved && updates[saved]?.status === "downloaded") {
+        loadModel(saved);
+      }
     };
     check();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Listen for download progress events from Rust ─────────────────────────
@@ -3375,6 +3174,43 @@ function OfflineAIApp() {
     }).then(fn => { unlisten = fn; });
     return () => unlisten?.();
   }, []);
+
+  // ── Security Shield: poll Rust every 3 s for file tampering ──────────────
+  // Rust "shield_check_files" compares mtime/atime/size against baseline and
+  // emits "shield-alert" events (which we also catch here as direct return).
+  const shieldedFilesRef = useRef(shieldedFiles);
+  useEffect(() => { shieldedFilesRef.current = shieldedFiles; }, [shieldedFiles]);
+
+  useEffect(() => {
+    // Also listen for the Tauri event (belt-and-suspenders)
+    let unlisten;
+    listen("shield-alert", (event) => {
+      const entry = event.payload;
+      setSecurityLog(prev => [{ ...entry, id: Date.now() }, ...prev.slice(0, 99)]);
+    }).then(u => { unlisten = u; });
+
+    // Active poll every 3 s — only when at least one file is protected
+    const timer = setInterval(async () => {
+      if (Object.keys(shieldedFilesRef.current).length === 0) return;
+      try {
+        const fired = await invoke("shield_check_files");
+        if (fired && fired.length > 0) {
+          setSecurityLog(prev => {
+            const next = [...fired.map(e => ({ ...e, id: Date.now() + Math.random() })), ...prev];
+            return next.slice(0, 100);
+          });
+        }
+      } catch (e) { /* ignore – Tauri not available in browser preview */ }
+    }, 3000);
+
+    return () => { unlisten?.(); clearInterval(timer); };
+  }, []);
+
+  // ── Persist active model ID so app reconnects automatically on next launch ─
+  useEffect(() => {
+    if (activeModelId) localStorage.setItem("active_model_id", activeModelId);
+    else localStorage.removeItem("active_model_id");
+  }, [activeModelId]);
 
   // ── Listen for llama.cpp token streaming events ───────────────────────────
   useEffect(() => {
@@ -3427,7 +3263,39 @@ function OfflineAIApp() {
   }, []);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chats, active]);
+  // Persist to localStorage (fast, session-safe)
   useEffect(() => { try { localStorage.setItem("codeforge_chats", JSON.stringify(chats)); } catch {} }, [chats]);
+  // Persist connectors (sources) — strips no data, safe for typical research docs
+  useEffect(() => { try { localStorage.setItem("connectors", JSON.stringify(connectors)); } catch {} }, [connectors]);
+
+  // Also persist to Tauri native storage (survives app reinstall, gives user a real file path)
+  // Runs debounced so we don't write on every keystroke
+  useEffect(() => {
+    if (typeof window.__tauriInvoke !== "function") { return; }
+    const timer = setTimeout(async () => {
+      for (const ch of chats) {
+        if (!ch.messages?.length) { continue; }
+        try {
+          await invoke("db_save_conversation", {
+            conversation: {
+              id:        String(ch.id),
+              title:     ch.title || "Chat",
+              timestamp: Date.now(),
+              language:  "general",
+              messages:  (ch.messages || []).map(m => ({
+                role:      m.role || (m.sender === "user" ? "user" : "assistant"),
+                content:   m.text || m.content || "",
+                model:     m.model || "local",
+                tokens:    m.tokens || 0,
+                timestamp: m.timestamp || Date.now(),
+              })),
+            },
+          });
+        } catch { /* non-critical — localStorage already saved */ }
+      }
+    }, 2000); // 2s debounce
+    return () => clearTimeout(timer);
+  }, [chats]);
 
   // ── Download model (single GGUF file) ─────────────────────────────────────
   const downloadModel = async (modelId) => {
@@ -3485,7 +3353,6 @@ function OfflineAIApp() {
   const installUpdate = async () => {
     setUpdateInstalling(true);
     setUpdateProgress(0);
-    // Listen for download progress
     let unlisten;
     try {
       const { listen } = await import("@tauri-apps/api/event");
@@ -3493,10 +3360,17 @@ function OfflineAIApp() {
     } catch {}
     try {
       await invoke("install_update");
-      // app.restart() is called in Rust — app will close and relaunch
+      // Rust calls app.restart() — app closes and relaunches automatically
     } catch (err) {
-      console.error("[update] install failed:", err);
-      alert("Update failed: " + err + "\n\nPlease download manually from the website.");
+      console.warn("[update] auto-install failed, opening browser:", err);
+      // Fall back: open the GitHub releases page so the user can download manually
+      const releaseUrl = updateAvailable?.url || "https://github.com/Edu124/Codeforge-ai/releases/latest";
+      try {
+        const { open } = await import("@tauri-apps/plugin-shell");
+        await open(releaseUrl);
+      } catch {
+        window.open(releaseUrl, "_blank");
+      }
       setUpdateInstalling(false);
       setUpdateProgress(0);
     } finally {
@@ -3518,14 +3392,31 @@ function OfflineAIApp() {
     }
   };
 
+  // ── Cancel in-progress download ───────────────────────────────────────────
+  const cancelDownload = async (modelId) => {
+    try {
+      await invoke("cancel_download");
+    } catch {}
+    setModelState(prev => ({ ...prev, [modelId]: { status: "not-downloaded" } }));
+  };
+
   // ── Delete model from disk ────────────────────────────────────────────────
   const deleteModel = async (modelId) => {
+    const model = MODELS.find(m => m.id === modelId);
+    const confirmed = window.confirm(
+      `Delete ${model?.label || modelId} from your device?\n\nThis will permanently remove the model file (~${model ? (model.sizeMB / 1024).toFixed(1) : "?"}  GB) from your hard drive.`
+    );
+    if (!confirmed) return;
     if (activeModelId === modelId) {
       await invoke("unload_model").catch(() => {});
       setActiveModelId(null);
     }
-    await invoke("delete_model", { modelId }).catch(() => {});
-    setModelState(prev => ({ ...prev, [modelId]: { status: "not-downloaded" } }));
+    try {
+      await invoke("delete_model", { modelId });
+      setModelState(prev => ({ ...prev, [modelId]: { status: "not-downloaded" } }));
+    } catch (err) {
+      alert("Could not delete model: " + err);
+    }
   };
 
   // ── Send message ──────────────────────────────────────────────────────────
@@ -3545,7 +3436,7 @@ function OfflineAIApp() {
     // Run domain analytics FIRST so we know if a formula was fully solved
     const calcResult = tryAnalyticalCalculation(text, connectors);
 
-    // Retrieve context chunks — period hint boosting already applied inside
+    // Analytics engine still uses stored chunks for structured value lookup
     let ctxChunks = retrieveContext(connectors, text);
 
     // When a formula was fully calculated, further narrow context to ONLY the
@@ -3568,6 +3459,15 @@ function OfflineAIApp() {
       }
     }
 
+    // Live-read sources from disk for full-fidelity LLM context (desktop only).
+    // Excel connectors are excluded — the Excel agent handles them via tool-calling
+    // so they never go through the prompt directly (avoids token overflow).
+    const nonExcelConnectors = connectors.filter(c => c.type !== "excel");
+    let liveCtx = null;
+    if (nonExcelConnectors.length && typeof window.__TAURI__ !== "undefined") {
+      try { liveCtx = await readSourcesLive(nonExcelConnectors); } catch (e) { console.warn("[sources]", e); }
+    }
+
     const sources = [...new Set(ctxChunks.map(c => c.source))];
 
     const aiMsg = { id: aiMsgId, role: "ai", text: "", time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), streaming: true, sources, calc: calcResult || undefined };
@@ -3587,15 +3487,23 @@ function OfflineAIApp() {
     } else {
       // Auto mode: detect from current message + last 4 user messages combined
       // (using conversation context makes short messages like "Merci" reliable)
-      const recentCtx = history.slice(-4).filter(m => m.role === "user").map(m => m.text).join(" ");
-      const detected  = detectLanguage(`${text} ${recentCtx}`);
-      if (detected !== "en") {
-        // Non-English detected — make it sticky for this conversation
-        effectiveLang = detected;
-        setAutoDetectedLang(detected);
-        autoDetectedLangRef.current = detected;
+      const detectedCurrent  = detectLanguage(text);
+      const recentCtx        = history.slice(-4).filter(m => m.role === "user").map(m => m.text).join(" ");
+      const detectedCombined = detectLanguage(`${text} ${recentCtx}`);
+
+      if (text.length >= 60 && detectedCurrent === "en") {
+        // Long message that is clearly English — always reset to English
+        // (handles templates/structured prompts sent inside a non-English conversation)
+        effectiveLang = "en";
+        setAutoDetectedLang("en");
+        autoDetectedLangRef.current = "en";
+      } else if (detectedCombined !== "en") {
+        // Non-English detected from current + recent context — make it sticky
+        effectiveLang = detectedCombined;
+        setAutoDetectedLang(detectedCombined);
+        autoDetectedLangRef.current = detectedCombined;
       } else {
-        // English (or ambiguous) — keep using the previously detected language
+        // Short/ambiguous message — keep previously detected language (e.g. "ok", "yes")
         effectiveLang = autoDetectedLangRef.current;
       }
     }
@@ -3619,8 +3527,143 @@ function OfflineAIApp() {
       }
     }
 
-    const prompt = buildPrompt(history, text + analyticsNote, ctxChunks, connectors, activeModelId, effectiveLang);
-    invoke("generate", { prompt, maxTokens: 2048, temperature: 0.7 }).catch(err => {
+    const prompt = buildPrompt(history, text + analyticsNote, liveCtx ? [] : ctxChunks, connectors, activeModelId, effectiveLang, liveCtx);
+
+    // Mobile browser — prefer WebLLM (fully offline), fall back to LAN
+    const isTauri = typeof window.__TAURI__ !== "undefined";
+    if (!isTauri) {
+      // ── Option A: WebLLM engine ready — run fully offline ──────────────────
+      if (wllmEngineRef.current && wllmStatus === "ready") {
+        try {
+          const msgs = [
+            { role: "system", content: buildSystemPrompt(connectors) },
+            ...history.slice(-10).map(m => ({ role: m.role === "user" ? "user" : "assistant", content: m.text })),
+            { role: "user", content: text },
+          ];
+          const stream = await wllmEngineRef.current.chat.completions.create({
+            messages: msgs,
+            stream: true,
+            max_tokens: 8192,
+            temperature: 0.5,
+          });
+          for await (const chunk of stream) {
+            const delta = chunk.choices[0]?.delta?.content || "";
+            if (delta) {
+              streamBufRef.current += delta;
+              const buf = streamBufRef.current;
+              setChats(prev => prev.map(ch => ch.id === activeRef.current
+                ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: buf, streaming: true } : m) }
+                : ch));
+            }
+          }
+          setChats(prev => prev.map(ch => ch.id === activeRef.current
+            ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, streaming: false } : m) }
+            : ch));
+        } catch (err) {
+          setChats(prev => prev.map(ch => ch.id === activeRef.current
+            ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: `⚠️ WebLLM error: ${err}`, streaming: false } : m) }
+            : ch));
+        }
+        setStreaming(false);
+        streamBufRef.current = "";
+        streamMsgIdRef.current = null;
+        return;
+      }
+
+      // ── Option B: LAN IP set — connect to desktop llama-server ─────────────
+      if (lanIP) {
+        try {
+          const res = await fetch(`http://${lanIP}:8080/completion`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt, n_predict: 2048, temperature: 0.5, stream: true }),
+          });
+          const reader = res.body.getReader();
+          const dec = new TextDecoder();
+          let done = false;
+          while (!done) {
+            const { value, done: d } = await reader.read();
+            done = d;
+            const chunk = dec.decode(value || new Uint8Array());
+            for (const line of chunk.split("\n")) {
+              if (!line.startsWith("data: ")) continue;
+              try {
+                const j = JSON.parse(line.slice(6));
+                if (j.content) {
+                  streamBufRef.current += j.content;
+                  const buf = streamBufRef.current;
+                  setChats(prev => prev.map(ch => ch.id === activeRef.current
+                    ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: buf, streaming: !j.stop } : m) }
+                    : ch));
+                }
+                if (j.stop) { done = true; break; }
+              } catch {}
+            }
+          }
+          setStreaming(false);
+          streamBufRef.current = "";
+          streamMsgIdRef.current = null;
+        } catch (err) {
+          setStreaming(false);
+          setChats(prev => prev.map(ch => ch.id === activeRef.current
+            ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: `⚠️ Could not reach desktop AI at ${lanIP}:8080 — make sure the model is loaded on your PC and both devices are on the same Wi-Fi.`, streaming: false } : m) }
+            : ch));
+        }
+        return;
+      }
+
+      // ── Option C: Nothing configured — prompt user to set up ───────────────
+      setStreaming(false);
+      setChats(prev => prev.map(ch => ch.id === activeRef.current
+        ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: "⚠️ No AI configured yet.\n\n**Option 1 — Offline AI (recommended):** Tap **Download AI** in the top bar to download a small AI model (~390 MB) that runs completely offline on your phone.\n\n**Option 2 — Desktop AI:** Make sure your desktop app is running with a model loaded, then tap **AI IP** and enter your PC's local IP address.", streaming: false } : m) }
+        : ch));
+      return;
+    }
+
+    // ── Excel agent: tool-calling approach — no token overflow possible ────────
+    const hasExcel = connectors.some(c => c.type === "excel" && c.sheets?.length);
+    if (hasExcel) {
+      const agentHandled = await runExcelAgent({
+        connectors,
+        question: text,
+        systemPrompt: buildSystemPrompt(connectors, effectiveLang),
+        modelId: activeModelId,
+        maxTokens: 8192,
+        temperature: 0.5,
+        onStatus: (msg) => {
+          if (msg) {
+            setChats(prev => prev.map(ch => ch.id === activeRef.current
+              ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: `🔍 ${msg}` } : m) }
+              : ch));
+            streamBufRef.current = "";
+          }
+        },
+        onToken: (token) => {
+          streamBufRef.current += token;
+          const buf = streamBufRef.current;
+          setChats(prev => prev.map(ch => ch.id === activeRef.current
+            ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: buf, streaming: true } : m) }
+            : ch));
+        },
+      }).catch(err => {
+        setChats(prev => prev.map(ch => ch.id === activeRef.current
+          ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, text: `⚠️ Error: ${String(err)}`, streaming: false } : m) }
+          : ch));
+        return true;
+      });
+
+      if (agentHandled) {
+        setChats(prev => prev.map(ch => ch.id === activeRef.current
+          ? { ...ch, messages: ch.messages.map(m => m.id === aiMsgId ? { ...m, streaming: false } : m) }
+          : ch));
+        setStreaming(false);
+        streamBufRef.current = "";
+        streamMsgIdRef.current = null;
+        return;
+      }
+    }
+
+    invoke("generate", { prompt, maxTokens: 8192, temperature: 0.5 }).catch(err => {
       const errText = String(err);
       setStreaming(false);
       streamBufRef.current = "";
@@ -3639,9 +3682,12 @@ function OfflineAIApp() {
     const id = Date.now();
     setChats(prev => [{ id, title: "New Chat", date: "Today", messages: [] }, ...prev]);
     setActive(id);
+    setShowHub(false);
     setAutoDetectedLang("en");
     autoDetectedLangRef.current = "en";
   };
+
+
 
   // ── Hub: send a message to a specific editor's chat ───────────────────────
   const sendHubMessage = useCallback(async (clientId, text) => {
@@ -3692,7 +3738,7 @@ function OfflineAIApp() {
       prompt += `<|im_start|>user\n${fullText}<|im_end|>\n<|im_start|>assistant\n`;
     }
 
-    invoke("generate", { prompt, maxTokens: 2048, temperature: 0.7 }).catch(err => {
+    invoke("generate", { prompt, maxTokens: 8192, temperature: 0.5 }).catch(err => {
       setHubStreaming(false);
       hubStreamBufRef.current = "";
       hubStreamMsgRef.current = null;
@@ -3702,6 +3748,82 @@ function OfflineAIApp() {
       );
     });
   }, [hubClients, hubStreaming, activeModelId]);
+
+  // ── Hub: Bug Scanner ──────────────────────────────────────────────────────
+  const triggerBugScan = useCallback(async (clientId) => {
+    const client = hubClients[clientId];
+    if (!client?.file || !activeModelId) return;
+    const code = client.selectedCode || "";
+    if (!code && !client.file) return;
+
+    setHubBugReports(prev => ({ ...prev, [clientId]: { scanning: true, bugs: [], scannedFile: client.file, scannedAt: null } }));
+
+    const scanPrompt = `You are a code security and bug analysis expert. Analyze the following ${client.language || "code"} code and identify ALL bugs, security vulnerabilities, and code quality issues.
+
+File: ${client.file}
+${code ? `\`\`\`${client.language || ""}\n${code}\n\`\`\`` : `(Full file: ${client.file})`}
+
+Respond with ONLY a JSON array (no markdown, no explanation outside JSON):
+[
+  {
+    "severity": "HIGH" | "MEDIUM" | "LOW" | "INFO",
+    "line": <line number or null>,
+    "title": "<short title>",
+    "description": "<what the issue is>",
+    "fix": "<how to fix it with example code if applicable>"
+  }
+]
+
+If no issues found, respond with: []`;
+
+    const isGemma = activeModelId.toLowerCase().includes("gemma");
+    let fullPrompt = "";
+    if (isGemma) {
+      fullPrompt = `<start_of_turn>user\n${scanPrompt}<end_of_turn>\n<start_of_turn>model\n`;
+    } else {
+      fullPrompt = `<|im_start|>system\nYou are a code analysis expert. Always respond with valid JSON only.<|im_end|>\n<|im_start|>user\n${scanPrompt}<|im_end|>\n<|im_start|>assistant\n`;
+    }
+
+    try {
+      const raw = await new Promise((resolve, reject) => {
+        let buf = "";
+        let unlistenToken, unlistenDone;
+        const cleanup = () => { try { unlistenToken?.(); } catch {} try { unlistenDone?.(); } catch {} };
+        const timer = setTimeout(() => { cleanup(); reject(new Error("Bug scan timed out")); }, 90_000);
+        Promise.all([
+          listen("llm-token", e => { buf += e.payload; }),
+          listen("llm-done", () => { clearTimeout(timer); cleanup(); resolve(buf.trim()); }),
+        ]).then(([ut, ud]) => {
+          unlistenToken = ut; unlistenDone = ud;
+          invoke("generate", { prompt: fullPrompt, maxTokens: 1024, temperature: 0.1 })
+            .catch(err => { clearTimeout(timer); cleanup(); reject(err); });
+        }).catch(err => { clearTimeout(timer); cleanup(); reject(err); });
+      });
+
+      let bugs = [];
+      const jsonMatch = raw.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        try { bugs = JSON.parse(jsonMatch[0]); } catch { bugs = []; }
+      }
+      setHubBugReports(prev => ({ ...prev, [clientId]: { scanning: false, bugs, scannedFile: client.file, scannedAt: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) } }));
+    } catch (e) {
+      console.error("[bugScan]", e);
+      setHubBugReports(prev => ({ ...prev, [clientId]: { scanning: false, bugs: [], scannedFile: client.file, scannedAt: null, error: String(e) } }));
+    }
+  }, [hubClients, activeModelId]);
+
+  // Auto-trigger bug scan when client file/code changes
+  useEffect(() => {
+    if (!activeModelId) return;
+    Object.values(hubClients).forEach(client => {
+      if (!client.file || !client.selectedCode) return;
+      const existing = hubBugReports[client.id];
+      if (!existing || existing.scannedFile !== client.file || (!existing.scanning && !existing.scannedAt)) {
+        const timer = setTimeout(() => triggerBugScan(client.id), 1500);
+        return () => clearTimeout(timer);
+      }
+    });
+  }, [hubClients, activeModelId]); // eslint-disable-line
 
   // ── Hub: apply AI response code back to the connected editor ─────────────
   const applyToEditor = useCallback(async (clientId, aiText) => {
@@ -3714,6 +3836,33 @@ function OfflineAIApp() {
         message: JSON.stringify({ type: "apply", code }),
       });
     } catch (e) { console.error("[hub_send]", e); }
+  }, []);
+
+  // ── Security Shield: protect / unprotect files ────────────────────────────
+  const shieldProtect = useCallback(async (path, fileType) => {
+    try {
+      const result = await invoke("shield_protect", { path, fileType });
+      setShieldedFiles(prev => ({
+        ...prev,
+        [path]: {
+          decoyPath: result.decoyPath,
+          protectedAt: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          fileName: path.split(/[\\/]/).pop(),
+          fileType,
+        }
+      }));
+      return result;
+    } catch (e) {
+      console.error("[shield]", e);
+      throw e;
+    }
+  }, []);
+
+  const shieldUnprotect = useCallback(async (path) => {
+    try {
+      await invoke("shield_unprotect", { path });
+      setShieldedFiles(prev => { const n = { ...prev }; delete n[path]; return n; });
+    } catch (e) { console.error("[shield]", e); }
   }, []);
 
   const activeChat = chats.find(c => c.id === active);
@@ -3742,7 +3891,7 @@ function OfflineAIApp() {
 
 
   return (
-    <div style={{ display: "flex", height: "100vh", background: C.bgDeep, fontFamily: "'DM Sans',-apple-system,sans-serif", overflow: "hidden" }} onClick={() => contextMenu && setContextMenu(null)}>
+    <div className="app-layout" style={{ background: C.bgDeep, fontFamily: "'DM Sans',-apple-system,sans-serif" }} onClick={() => contextMenu && setContextMenu(null)}>
       <style>{`
         *{box-sizing:border-box;margin:0;padding:0}
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&display=swap');
@@ -3756,10 +3905,10 @@ function OfflineAIApp() {
       `}</style>
 
       {/* ── Sidebar ── */}
-      <div style={{ width: 240, background: C.bgPanel, borderRight: `1px solid ${C.border}`, display: "flex", flexDirection: "column", flexShrink: 0 }}>
+      <div className="sidebar" style={{ background: C.bgPanel, borderRight: `1px solid ${C.border}` }}>
 
         {/* Logo */}
-        <div style={{ padding: "18px 16px 14px", borderBottom: `1px solid ${C.border}` }}>
+        <div className="sidebar-header" style={{ padding: "18px 16px 14px", borderBottom: `1px solid ${C.border}` }}>
           <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
             <div style={{ width: 32, height: 32, borderRadius: 9, background: `linear-gradient(135deg,${C.blueD},${C.cyan})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
               <Icon d={IC.brain} size={16} stroke="#fff" />
@@ -3775,7 +3924,7 @@ function OfflineAIApp() {
         </div>
 
         {/* Search */}
-        <div style={{ padding: "10px 12px 6px" }}>
+        <div className="sidebar-search" style={{ padding: "10px 12px 6px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "7px 10px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 8 }}>
             <Icon d={IC.search} size={12} stroke={C.t3} />
             <input value={sSearch} onChange={e => setSSearch(e.target.value)} placeholder="Search chats…"
@@ -3784,13 +3933,13 @@ function OfflineAIApp() {
         </div>
 
         {/* Chat list */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "6px 8px" }} onClick={() => setContextMenu(null)}>
+        <div className="sidebar-chat-list" style={{ padding: "6px 8px" }} onClick={() => setContextMenu(null)}>
           {filteredChats.map(ch => {
             const snippet = getMatchSnippet(ch);
             const isRenaming = renamingId === ch.id;
             return (
               <div key={ch.id}
-                onClick={() => { setContextMenu(null); if (!isRenaming) setActive(ch.id); }}
+                onClick={() => { setContextMenu(null); if (!isRenaming) { setActive(ch.id); setShowHub(false); } }}
                 onContextMenu={e => {
                   e.preventDefault();
                   e.stopPropagation();
@@ -3836,8 +3985,30 @@ function OfflineAIApp() {
           })}
         </div>
 
-        {/* Bottom nav */}
-        <div style={{ padding: "10px 8px", borderTop: `1px solid ${C.border}`, display: "flex", flexDirection: "column", gap: 2 }}>
+        {/* Bottom nav — mobile: icon tabs | desktop: text buttons */}
+        <div style={{ padding: isDesktop ? "10px 8px" : "0", borderTop: `1px solid ${C.border}`, display: "flex", flexDirection: isDesktop ? "column" : "row", gap: isDesktop ? 2 : 0 }}>
+
+          {/* ── Mobile tab bar ── */}
+          {!isDesktop && [
+            { id: "chat",   icon: IC.chat,    label: "Chat"  },
+            { id: "music",  icon: IC.music,   label: "Music" },
+            { id: "games",  icon: IC.gamepad, label: "Games" },
+            { id: "models", icon: IC.server,  label: "AI"    },
+          ].map(tab => (
+            <button key={tab.id}
+              className="mobile-tab-btn"
+              onClick={() => { setMobileTab(tab.id); }}
+              style={{
+                color: mobileTab === tab.id ? C.blue : C.t3,
+                borderTop: mobileTab === tab.id ? `2px solid ${C.blue}` : "2px solid transparent",
+              }}>
+              <Icon d={tab.icon} size={20} stroke={mobileTab === tab.id ? C.blue : C.t3} />
+              <span style={{ fontWeight: mobileTab === tab.id ? 600 : 400 }}>{tab.label}</span>
+            </button>
+          ))}
+
+          {/* ── Desktop buttons ── */}
+          {isDesktop && <>
           {[
             { icon: IC.server, label: "Models",  action: () => { setShowHub(false); setShowMod(true); } },
             { icon: IC.plug,   label: "Sources", action: () => { setShowHub(false); setShowConn(true); } },
@@ -3846,42 +4017,25 @@ function OfflineAIApp() {
               <Icon d={icon} size={14} stroke={C.t3} />{label}
             </Btn>
           ))}
-
-          {/* Financial Analyst button */}
-          <Btn onClick={() => { setShowFinance(f => !f); setShowHub(false); }} style={{
+          <Btn onClick={() => { setShowHub(h => !h); }} style={{
             width: "100%", padding: "9px 10px", borderRadius: 8, border: "none", textAlign: "left",
-            background: showFinance ? "rgba(34,197,94,0.12)" : "transparent",
-            color: showFinance ? C.green : C.t2, fontSize: 12.5, display: "flex", alignItems: "center", gap: 8,
+            background: showHub ? "rgba(168,85,247,0.12)" : "transparent",
+            color: showHub ? C.purple : C.t2, fontSize: 12.5, display: "flex", alignItems: "center", gap: 8,
           }}>
-            <Icon d={IC.chart} size={14} stroke={showFinance ? C.green : C.t3} />
-            Finance
+            <Icon d={IC.hub} size={14} stroke={showHub ? C.purple : C.t3} />
+            Hub
             <span style={{ marginLeft: "auto", fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 10,
-              background: "rgba(34,197,94,0.15)", color: C.green, border: "1px solid rgba(34,197,94,0.3)" }}>
-              NEW
+              background: trialDaysLeft === null ? "rgba(168,85,247,0.18)" : trialDaysLeft <= 0 ? "rgba(239,68,68,0.15)" : "rgba(168,85,247,0.18)",
+              color: trialDaysLeft === null ? C.purple : trialDaysLeft <= 0 ? C.red : C.purple,
+              border: `1px solid ${trialDaysLeft !== null && trialDaysLeft <= 0 ? "rgba(239,68,68,0.3)" : "rgba(168,85,247,0.3)"}`,
+            }}>
+              {trialDaysLeft === null ? "5d trial" : trialDaysLeft <= 0 ? "Expired" : `${trialDaysLeft}d left`}
             </span>
           </Btn>
+          </> /* end desktop buttons */}
 
-          {/* Extension Hub button — desktop only */}
+          {/* Model status chip — desktop only */}
           {isDesktop && (
-            <Btn onClick={() => { setShowHub(h => !h); setShowFinance(false); }} style={{
-              width: "100%", padding: "9px 10px", borderRadius: 8, border: "none", textAlign: "left",
-              background: showHub ? "rgba(168,85,247,0.12)" : "transparent",
-              color: showHub ? C.purple : C.t2, fontSize: 12.5, display: "flex", alignItems: "center", gap: 8,
-            }}>
-              <Icon d={IC.hub} size={14} stroke={showHub ? C.purple : C.t3} />
-              Hub
-              {/* Trial badge — shows days left or Expired */}
-              <span style={{ marginLeft: "auto", fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 10,
-                background: trialDaysLeft === null ? "rgba(168,85,247,0.18)" : trialDaysLeft <= 0 ? "rgba(239,68,68,0.15)" : "rgba(168,85,247,0.18)",
-                color: trialDaysLeft === null ? C.purple : trialDaysLeft <= 0 ? C.red : C.purple,
-                border: `1px solid ${trialDaysLeft !== null && trialDaysLeft <= 0 ? "rgba(239,68,68,0.3)" : "rgba(168,85,247,0.3)"}`,
-              }}>
-                {trialDaysLeft === null ? "5d trial" : trialDaysLeft <= 0 ? "Expired" : `${trialDaysLeft}d left`}
-              </span>
-            </Btn>
-          )}
-
-          {/* Model status chip */}
           <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "9px 10px", background: C.bgCard, borderRadius: 8, border: `1px solid ${C.border}`, marginTop: 4 }}>
             <Dot color={statusColor} pulse={ms?.status === "loaded" || modelLoading} />
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -3891,15 +4045,117 @@ function OfflineAIApp() {
               )}
             </div>
           </div>
+          )}
+
 
         </div>
       </div>
 
       {/* ── Main area ── */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div className="main-area">
 
-        {/* Top bar */}
-        <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", background: C.bgPanel }}>
+        {/* ── Mobile top bar ── */}
+        {!isDesktop && (
+          <div style={{ padding: "0 14px", height: 54, background: C.bgPanel, borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, zIndex: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              <div style={{ width: 28, height: 28, borderRadius: 8, background: `linear-gradient(135deg,${C.blueD},${C.cyan})`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <Icon d={IC.brain} size={14} stroke="#fff" />
+              </div>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: C.t1 }}>OfflineAI</div>
+                <div style={{ fontSize: 9, color: statusColor, display: "flex", alignItems: "center", gap: 4 }}>
+                  <Dot color={statusColor} pulse={ms?.status === "loaded"} />
+                  {statusLabel}
+                </div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              {/* WebLLM status / download button */}
+              {wllmStatus === "ready" ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(34,197,94,0.12)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: 8, padding: "6px 10px" }}>
+                  <Dot color={C.green} pulse />
+                  <span style={{ fontSize: 11, color: C.green, fontWeight: 600 }}>AI Ready</span>
+                </div>
+              ) : wllmStatus === "downloading" || wllmStatus === "loading" ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(168,85,247,0.12)", border: "1px solid rgba(168,85,247,0.3)", borderRadius: 8, padding: "6px 10px" }}>
+                  <Spinner size={10} />
+                  <span style={{ fontSize: 11, color: C.purple, fontWeight: 600 }}>{wllmProgress}%</span>
+                </div>
+              ) : (
+                <button onClick={() => setShowLanSet(s => !s)} style={{ background: lanIP ? "rgba(34,197,94,0.12)" : "rgba(59,130,246,0.12)", border: `1px solid ${lanIP ? "rgba(34,197,94,0.3)" : "rgba(59,130,246,0.3)"}`, borderRadius: 8, color: lanIP ? C.green : C.blue, fontSize: 11, fontWeight: 600, padding: "6px 10px", cursor: "pointer", WebkitTapHighlightColor: "transparent" }}>
+                  {lanIP ? "AI ✓" : "Setup AI"}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Mobile AI setup panel */}
+        {!isDesktop && showLanSet && (
+          <div style={{ padding: "14px", background: C.bgPanel, borderBottom: `1px solid ${C.border}` }}>
+            {/* Tab: Offline AI vs Desktop AI */}
+            <div style={{ display: "flex", gap: 0, marginBottom: 12, background: C.bgCard, borderRadius: 8, padding: 3 }}>
+              {[["offline", "📱 Offline AI"], ["lan", "💻 Desktop AI"]].map(([k, lbl]) => (
+                <button key={k} onClick={() => { if (typeof window !== "undefined") window.__aiSetupTab = k; setShowLanSet(true); }}
+                  id={`ai-tab-${k}`}
+                  style={{ flex: 1, padding: "7px 4px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11, fontWeight: 600,
+                    background: "transparent", color: C.t2, WebkitTapHighlightColor: "transparent" }}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+
+            {/* Offline AI: WebLLM download */}
+            <div id="ai-panel-offline">
+              <div style={{ fontSize: 11, color: C.t3, marginBottom: 10 }}>Downloads once (~390 MB). Works fully offline forever after.</div>
+              <select value={wllmModel} onChange={e => setWllmModel(e.target.value)}
+                style={{ width: "100%", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 8, color: C.t1, fontSize: 12, padding: "8px 10px", marginBottom: 10, fontFamily: "inherit" }}>
+                {WLLM_MODELS.map(m => (
+                  <option key={m.id} value={m.id}>{m.label} — {m.size} ({m.note})</option>
+                ))}
+              </select>
+              {(wllmStatus === "downloading" || wllmStatus === "loading") ? (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span style={{ fontSize: 11, color: C.purple }}>{wllmMsg}</span>
+                    <span style={{ fontSize: 11, color: C.purple }}>{wllmProgress}%</span>
+                  </div>
+                  <div style={{ height: 4, background: C.bgDeep, borderRadius: 4 }}>
+                    <div style={{ height: "100%", width: `${wllmProgress}%`, background: C.purple, borderRadius: 4, transition: "width 0.4s" }} />
+                  </div>
+                </div>
+              ) : wllmStatus === "ready" ? (
+                <div style={{ padding: "8px 12px", background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)", borderRadius: 8, fontSize: 12, color: C.green, marginBottom: 10 }}>
+                  ✓ AI ready — fully offline
+                </div>
+              ) : wllmStatus === "error" ? (
+                <div style={{ padding: "8px 12px", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 8, fontSize: 11, color: C.red, marginBottom: 10 }}>
+                  {wllmMsg}
+                </div>
+              ) : null}
+              {wllmStatus !== "ready" && (
+                <button onClick={() => { initWebLLM(wllmModel); setShowLanSet(false); }}
+                  disabled={wllmStatus === "downloading" || wllmStatus === "loading"}
+                  style={{ width: "100%", padding: "10px", background: C.blue, border: "none", borderRadius: 8, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", WebkitTapHighlightColor: "transparent", opacity: (wllmStatus === "downloading" || wllmStatus === "loading") ? 0.6 : 1 }}>
+                  {wllmStatus === "downloading" || wllmStatus === "loading" ? "Downloading…" : "Download AI Model"}
+                </button>
+              )}
+            </div>
+
+            {/* LAN AI: desktop IP */}
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: 11, color: C.t3, marginBottom: 6 }}>Or connect to your desktop PC on the same Wi-Fi (run <strong style={{ color: C.t2 }}>ipconfig</strong> on PC to find its IP)</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input value={lanIP} onChange={e => setLanIP(e.target.value)} placeholder="e.g. 192.168.1.5"
+                  style={{ flex: 1, background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 8, color: C.t1, fontSize: 13, padding: "8px 10px", fontFamily: "inherit" }} />
+                <button onClick={() => { localStorage.setItem("lan_ip", lanIP); setShowLanSet(false); }} style={{ padding: "8px 14px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 8, color: C.t2, fontSize: 12, fontWeight: 600, cursor: "pointer", WebkitTapHighlightColor: "transparent" }}>Save</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Desktop top bar ── */}
+        {isDesktop && <div style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", background: C.bgPanel }}>
           <div style={{ fontSize: 14, fontWeight: 600, color: C.t1 }}>
             {showHub ? (
               <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -3916,7 +4172,7 @@ function OfflineAIApp() {
               </div>
             )}
           </div>
-        </div>
+        </div>}
 
         {/* ── Update available banner ── */}
         {updateAvailable && !updateDismissed && (
@@ -3940,8 +4196,8 @@ function OfflineAIApp() {
           </div>
         )}
 
-        {/* Setup banner */}
-        {serverReady === false && !setupProgress && (
+        {/* Setup banner — desktop only (Tauri) */}
+        {isDesktop && serverReady === false && !setupProgress && (
           <div style={{ padding: "10px 20px", borderBottom: `1px solid ${C.border}`, background: "rgba(168,85,247,0.05)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
               <div style={{ fontSize: 12.5, color: C.t2 }}>
@@ -3953,7 +4209,7 @@ function OfflineAIApp() {
             </div>
           </div>
         )}
-        {setupProgress && setupProgress.step !== "error" && (
+        {isDesktop && setupProgress && setupProgress.step !== "error" && (
           <div style={{ padding: "10px 20px", borderBottom: `1px solid ${C.border}`, background: "rgba(168,85,247,0.05)" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <Spinner />
@@ -3974,15 +4230,15 @@ function OfflineAIApp() {
             </div>
           </div>
         )}
-        {setupProgress?.step === "error" && (
+        {isDesktop && setupProgress?.step === "error" && (
           <div style={{ padding: "10px 20px", borderBottom: `1px solid ${C.border}`, background: "rgba(239,68,68,0.05)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <span style={{ fontSize: 12.5, color: C.red }}>Setup failed: {setupProgress.message}</span>
             <Btn onClick={runSetup} style={{ padding: "6px 12px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 7, color: C.red, fontSize: 12 }}>Retry</Btn>
           </div>
         )}
 
-        {/* No model banner */}
-        {!activeModelId && (
+        {/* No model banner — desktop only */}
+        {isDesktop && !activeModelId && !modelLoading && (
           <div style={{ padding: "10px 20px", borderBottom: `1px solid ${C.border}`, background: "rgba(59,130,246,0.05)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
               <div style={{ fontSize: 12.5, color: C.t2 }}>
@@ -3995,28 +4251,139 @@ function OfflineAIApp() {
           </div>
         )}
 
-        {/* Model loading banner */}
-        {modelLoading && (
+        {/* Model loading banner — desktop only */}
+        {isDesktop && modelLoading && (
           <div style={{ padding: "10px 20px", borderBottom: `1px solid ${C.border}`, background: "rgba(245,158,11,0.05)", display: "flex", alignItems: "center", gap: 10 }}>
             <Spinner />
             <span style={{ fontSize: 12.5, color: C.amber }}>Connecting to model… this may take 10–30 seconds.</span>
           </div>
         )}
 
-        {/* ── Financial Analyst Panel ── */}
-        {showFinance ? (
-          <FinancialAnalystPanel
-            workbooks={finWorkbooks}       setWorkbooks={setFinWorkbooks}
-            activeWb={finActiveWb}         setActiveWb={setFinActiveWb}
-            activeSheet={finActiveSheet}   setActiveSheet={setFinActiveSheet}
-            messages={finMessages}         setMessages={setFinMessages}
-            input={finInput}               setInput={setFinInput}
-            streaming={finStreaming}        setStreaming={setFinStreaming}
-            loading={finLoading}           setLoading={setFinLoading}
-            streamRef={finStreamRef}       bufRef={finBufRef}
-            activeModelId={activeModelId}
-          />
-        ) : showHub ? (
+        {/* Mobile Music Studio */}
+        {!isDesktop && mobileTab === "music" && <MusicStudio />}
+
+        {/* Mobile Games */}
+        {!isDesktop && mobileTab === "games" && <GamesPanel />}
+
+        {/* Mobile AI Setup — WebLLM (runs in browser, no Tauri needed) */}
+        {!isDesktop && mobileTab === "models" && (
+          <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bgDeep, overflow:"hidden" }}>
+            {/* Header */}
+            <div style={{ padding:"16px", background:C.bgPanel, borderBottom:`1px solid ${C.border}`, flexShrink:0 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                <div style={{ width:36, height:36, borderRadius:10, background:`linear-gradient(135deg,${C.blue},${C.cyan})`, display:"flex", alignItems:"center", justifyContent:"center" }}>
+                  <Icon d={IC.brain} size={18} stroke="#fff" />
+                </div>
+                <div>
+                  <div style={{ fontSize:16, fontWeight:700, color:C.t1 }}>AI Setup</div>
+                  <div style={{ fontSize:11, color:C.t3 }}>Download once · runs offline forever on your phone</div>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ flex:1, overflowY:"auto", padding:"14px 12px" }}>
+
+              {/* Current status banner */}
+              <div style={{ display:"flex", alignItems:"center", gap:10, padding:"12px 14px", borderRadius:12, marginBottom:16,
+                background: wllmStatus==="ready" ? "rgba(34,197,94,0.08)" : "rgba(59,130,246,0.06)",
+                border: `1px solid ${wllmStatus==="ready" ? "rgba(34,197,94,0.25)" : C.border}` }}>
+                <Dot color={wllmStatus==="ready" ? C.green : wllmStatus==="downloading"||wllmStatus==="loading" ? C.amber : C.t3}
+                     pulse={wllmStatus==="downloading"||wllmStatus==="loading"||wllmStatus==="ready"} />
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:12, fontWeight:600,
+                    color: wllmStatus==="ready" ? C.green : wllmStatus==="downloading"||wllmStatus==="loading" ? C.amber : C.t2 }}>
+                    {wllmStatus==="ready"    ? "AI Ready — fully offline ✓"
+                   : wllmStatus==="downloading"||wllmStatus==="loading" ? "Setting up AI…"
+                   : wllmStatus==="error"   ? "Setup failed"
+                   : "No AI model loaded"}
+                  </div>
+                  {wllmStatus==="ready" && <div style={{ fontSize:10, color:C.t3, marginTop:1 }}>{WLLM_MODELS.find(m=>m.id===wllmModel)?.label} · chat is ready</div>}
+                  {wllmStatus==="error" && <div style={{ fontSize:10, color:C.red, marginTop:1 }}>{wllmMsg}</div>}
+                </div>
+                {wllmStatus==="ready" && (
+                  <button onClick={() => setMobileTab("chat")} style={{ padding:"7px 14px", borderRadius:9, border:"none", background:C.green, color:"#fff", fontSize:12, fontWeight:700, cursor:"pointer", flexShrink:0 }}>
+                    Chat →
+                  </button>
+                )}
+              </div>
+
+              {/* Download progress */}
+              {(wllmStatus==="downloading" || wllmStatus==="loading") && (
+                <div style={{ padding:"14px", background:C.bgCard, borderRadius:12, border:`1px solid ${C.border}`, marginBottom:16 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+                    <Spinner />
+                    <span style={{ fontSize:12, color:C.t2, flex:1, minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{wllmMsg || "Loading…"}</span>
+                    <span style={{ fontSize:12, fontWeight:700, color:C.purple, flexShrink:0 }}>{wllmProgress}%</span>
+                  </div>
+                  <div style={{ height:6, background:C.bgDeep, borderRadius:6, overflow:"hidden" }}>
+                    <div style={{ height:"100%", width:`${wllmProgress}%`, background:`linear-gradient(90deg,${C.blue},${C.purple})`, borderRadius:6, transition:"width 0.4s" }} />
+                  </div>
+                  <div style={{ fontSize:10, color:C.t3, marginTop:6 }}>
+                    Model is being cached on your device. Keep this screen open.
+                  </div>
+                </div>
+              )}
+
+              {/* Model selection */}
+              <div style={{ fontSize:11, color:C.t3, fontWeight:600, marginBottom:8 }}>CHOOSE A MODEL</div>
+              {WLLM_MODELS.map(m => {
+                const isActive = wllmModel === m.id;
+                const isLoaded = wllmStatus==="ready" && wllmModel===m.id;
+                return (
+                  <div key={m.id}
+                    onClick={() => { if(wllmStatus!=="downloading"&&wllmStatus!=="loading") setWllmModel(m.id); }}
+                    style={{ background:C.bgCard, borderRadius:12, padding:"14px", marginBottom:10,
+                      border:`2px solid ${isLoaded ? C.green : isActive ? C.blue : C.border}`,
+                      cursor: wllmStatus==="downloading"||wllmStatus==="loading" ? "default" : "pointer" }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                      <div style={{ width:38, height:38, borderRadius:9, background: isLoaded ? `${C.green}18` : isActive ? `${C.blue}18` : C.bgPanel,
+                        border:`1px solid ${isLoaded ? C.green : isActive ? C.blue : C.border}`,
+                        display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                        <Icon d={IC.brain} size={16} stroke={isLoaded ? C.green : isActive ? C.blue : C.t3} />
+                      </div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap", marginBottom:2 }}>
+                          <span style={{ fontSize:13, fontWeight:700, color: isLoaded ? C.green : isActive ? C.blue : C.t1 }}>{m.label}</span>
+                          <span style={{ fontSize:9, padding:"1px 7px", borderRadius:10, background: isLoaded ? `${C.green}18` : `${C.blue}18`, color: isLoaded ? C.green : C.blue, border:`1px solid ${isLoaded ? C.green : C.blue}30` }}>
+                            {isLoaded ? "Active" : m.size}
+                          </span>
+                        </div>
+                        <div style={{ fontSize:11, color:C.t3 }}>{m.note}</div>
+                      </div>
+                      {isActive && !isLoaded && <div style={{ width:18, height:18, borderRadius:"50%", border:`2px solid ${C.blue}`, display:"flex", alignItems:"center", justifyContent:"center" }}><div style={{ width:8, height:8, borderRadius:"50%", background:C.blue }} /></div>}
+                      {isLoaded && <span style={{ fontSize:16 }}>✓</span>}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Action button */}
+              <button
+                onClick={() => { if(wllmStatus!=="downloading"&&wllmStatus!=="loading") initWebLLM(wllmModel); }}
+                disabled={wllmStatus==="downloading"||wllmStatus==="loading"}
+                style={{ width:"100%", padding:"15px", borderRadius:12, border:"none", marginTop:4, marginBottom:16,
+                  cursor: wllmStatus==="downloading"||wllmStatus==="loading" ? "not-allowed" : "pointer",
+                  background: wllmStatus==="ready" ? `${C.green}18` : wllmStatus==="downloading"||wllmStatus==="loading" ? C.bgCard : `linear-gradient(135deg,${C.blue},${C.cyan})`,
+                  border: wllmStatus==="ready" ? `1px solid ${C.green}40` : "none",
+                  color: wllmStatus==="ready" ? C.green : wllmStatus==="downloading"||wllmStatus==="loading" ? C.t3 : "#fff",
+                  fontSize:14, fontWeight:700,
+                  display:"flex", alignItems:"center", justifyContent:"center", gap:10 }}>
+                {wllmStatus==="downloading"||wllmStatus==="loading"
+                  ? <><Spinner />Setting up… {wllmProgress}%</>
+                  : wllmStatus==="ready"
+                  ? "✓ AI Ready — tap to reload"
+                  : <><Icon d={IC.dl} size={16} stroke="#fff" />Download & Setup AI</>}
+              </button>
+
+              <div style={{ fontSize:10, color:C.t3, textAlign:"center", lineHeight:1.7, padding:"0 8px" }}>
+                Model downloads once (~390MB for Qwen 0.5B) and is cached in your browser.{"\n"}
+                After setup, AI works with <strong style={{ color:C.t2 }}>no internet, no laptop needed</strong>.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showHub ? (
           <HubPanel
             hubClients={hubClients}
             activeHubId={activeHubId}
@@ -4026,17 +4393,23 @@ function OfflineAIApp() {
             onApply={applyToEditor}
             activeModelId={activeModelId}
             trialDaysLeft={trialDaysLeft}
+            bugReports={hubBugReports}
+            onBugScan={triggerBugScan}
+            shieldedFiles={shieldedFiles}
+            securityLog={securityLog}
+            onShieldProtect={shieldProtect}
+            onShieldUnprotect={shieldUnprotect}
           />
-        ) : (
+        ) : (!isDesktop && mobileTab !== "chat") ? null : (
           <>
         {/* Messages */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+        <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px", WebkitOverflowScrolling: "touch" }}>
           {activeChat?.messages.map(msg => <Bubble key={msg.id} msg={msg} />)}
           <div ref={bottomRef} />
         </div>
 
-        {/* Quick prompts */}
-        {(!activeChat?.messages || activeChat.messages.length <= 1) && (
+        {/* Quick prompts — desktop only */}
+        {isDesktop && (!activeChat?.messages || activeChat.messages.length <= 1) && (
           <div style={{ padding: "0 24px 10px", display: "flex", gap: 7, flexWrap: "wrap" }}>
             {quickPrompts.map(p => (
               <Btn key={p} onClick={() => { setInput(p); inputRef.current?.focus(); }}
@@ -4048,7 +4421,7 @@ function OfflineAIApp() {
         )}
 
         {/* Input */}
-        <div style={{ padding: "10px 20px 16px", background: C.bgPanel, borderTop: `1px solid ${C.border}`, position: "relative" }}>
+        <div style={{ padding: isDesktop ? "10px 20px 16px" : "10px 12px 12px", background: C.bgPanel, borderTop: `1px solid ${C.border}`, position: "relative" }}>
           {/* Template panel */}
           {showTemplates && (
             <TemplatePanel
@@ -4068,19 +4441,21 @@ function OfflineAIApp() {
             />
           )}
           <div style={{ display: "flex", alignItems: "flex-end", gap: 10, padding: "10px 14px", background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 14 }}>
-            {/* Templates toggle button */}
+            {/* Templates toggle button — desktop only */}
+            {isDesktop && (
             <Btn onClick={() => setShowTemplates(v => !v)} title="Prompt Templates" style={{
               flexShrink: 0, padding: "5px 9px", borderRadius: 8, fontSize: 14,
               background: showTemplates ? C.blue : "transparent",
               border: `1px solid ${showTemplates ? C.blue : C.border}`,
               color: showTemplates ? "#fff" : C.t2, lineHeight: 1,
             }}>⚡</Btn>
+            )}
             <textarea
               ref={inputRef}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-              placeholder={activeModelId ? "Ask a research question… (Enter to send, Shift+Enter for newline)" : "Download a model first to start chatting"}
+              placeholder={isDesktop ? (activeModelId ? "Ask a research question… (Enter to send, Shift+Enter for newline)" : "Download a model first to start chatting") : (lanIP ? "Ask anything… (AI connected via Wi-Fi)" : "Ask anything… (tap AI IP above to connect AI)")}
               rows={1}
               style={{ flex: 1, background: "none", border: "none", color: C.t1, fontSize: 13.5, lineHeight: 1.6, maxHeight: 120, overflowY: "auto", fontFamily: "inherit" }}
             />
@@ -4093,18 +4468,19 @@ function OfflineAIApp() {
                 <Icon d={IC.stop} size={14} fill={C.red} stroke="none" />
               </Btn>
             ) : (
-              <Btn onClick={send} disabled={!input.trim() || !activeModelId} style={{
+              <Btn onClick={send} disabled={!input.trim() || (isDesktop && !activeModelId)} style={{
                 width: 36, height: 36, borderRadius: 9, border: "none", flexShrink: 0,
-                background: input.trim() && activeModelId ? C.blue : C.bgPanel,
+                background: input.trim() && (!isDesktop || activeModelId) ? C.blue : C.bgPanel,
                 display: "flex", alignItems: "center", justifyContent: "center",
-                color: input.trim() && activeModelId ? "#fff" : C.t3,
+                color: input.trim() && (!isDesktop || activeModelId) ? "#fff" : C.t3,
               }}>
                 <Icon d={IC.send} size={15} />
               </Btn>
             )}
           </div>
 
-          {/* Language selector + footer */}
+          {/* Language selector + footer — desktop only (takes too much space on mobile) */}
+          {isDesktop && (
           <div style={{ marginTop: 8, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
             {/* Left: language pills */}
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -4112,7 +4488,6 @@ function OfflineAIApp() {
               <span style={{ fontSize: 11, color: C.t2, fontWeight: 500 }}>Language:</span>
               {LANG_OPTIONS.map(({ id, label }) => {
                 const isActive = selectedLang === id;
-                // In Auto mode, show what language was detected (e.g. "Auto · FR")
                 const showDetected = id === "auto" && isActive && autoDetectedLang !== "en";
                 const displayLabel = showDetected ? `Auto · ${autoDetectedLang.toUpperCase()}` : label;
                 return (
@@ -4142,6 +4517,11 @@ function OfflineAIApp() {
             {/* Right: privacy note */}
             <div style={{ fontSize: 10, color: C.t3, whiteSpace: "nowrap" }}>100% on-device · no data sent</div>
           </div>
+          )}
+          {/* Mobile: compact footer */}
+          {!isDesktop && (
+            <div style={{ marginTop: 6, textAlign: "center", fontSize: 10, color: C.t3 }}>100% on-device · no data sent</div>
+          )}
         </div>
           </>
         )}
@@ -4157,6 +4537,7 @@ function OfflineAIApp() {
           onDownload={(id) => downloadModel(id)}
           onLoad={(id) => { loadModel(id); setShowMod(false); }}
           onDelete={deleteModel}
+          onCancelDownload={cancelDownload}
           onResetServer={resetServer}
           onClose={() => setShowMod(false)}
         />
@@ -4166,6 +4547,7 @@ function OfflineAIApp() {
           connectors={connectors}
           onAdd={c => setConnectors(prev => [...prev, c])}
           onRemove={id => setConnectors(prev => prev.filter(c => c.id !== id))}
+          onUpdate={(id, updates) => setConnectors(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c))}
           onClose={() => setShowConn(false)}
         />
       )}
@@ -4238,7 +4620,997 @@ function AuthGate() {
   return isSignedIn ? <OfflineAIApp /> : <LoginPage />;
 }
 
+// ─── Games Panel (mobile-only) ────────────────────────────────────────────────
+function GamesPanel() {
+  const [game, setGame] = useState(null);
+  if (game === "ttt")    return <GameTTT    onBack={() => setGame(null)} />;
+  if (game === "2048")   return <Game2048   onBack={() => setGame(null)} />;
+  if (game === "memory") return <GameMemory onBack={() => setGame(null)} />;
+  if (game === "rps")    return <GameRPS    onBack={() => setGame(null)} />;
+  if (game === "snake")  return <GameSnake  onBack={() => setGame(null)} />;
+
+  const GAMES = [
+    { id:"ttt",    emoji:"⭕",  title:"Tic-Tac-Toe",  desc:"Beat the AI or play with a friend",  tag:"1–2 players", color:C.blue },
+    { id:"2048",   emoji:"🔢",  title:"2048",          desc:"Slide tiles and reach 2048",          tag:"Solo",        color:C.cyan },
+    { id:"memory", emoji:"🃏",  title:"Memory Match",  desc:"Flip & match pairs — 1 or 2 players",tag:"1–2 players", color:C.purple },
+    { id:"rps",    emoji:"✊",  title:"Rock Paper Scissors", desc:"Quick best-of-5 vs the AI",     tag:"Solo",        color:C.green },
+    { id:"snake",  emoji:"🐍",  title:"Snake",         desc:"Classic snake — swipe or arrow keys", tag:"Solo",        color:C.amber },
+  ];
+  return (
+    <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bgDeep, overflow:"hidden" }}>
+      <div style={{ padding:"16px", background:C.bgPanel, borderBottom:`1px solid ${C.border}`, flexShrink:0 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ width:36, height:36, borderRadius:10, background:`linear-gradient(135deg,${C.blue},${C.purple})`, display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <Icon d={IC.gamepad} size={18} stroke="#fff" />
+          </div>
+          <div>
+            <div style={{ fontSize:16, fontWeight:700, color:C.t1 }}>Games</div>
+            <div style={{ fontSize:11, color:C.t3 }}>Play offline · solo or with friends</div>
+          </div>
+        </div>
+      </div>
+      <div style={{ flex:1, overflowY:"auto", padding:"14px 12px" }}>
+        {GAMES.map(g => (
+          <div key={g.id} onClick={() => setGame(g.id)} style={{ background:C.bgCard, borderRadius:14, padding:"16px", marginBottom:10, border:`1px solid ${C.border}`, cursor:"pointer", display:"flex", alignItems:"center", gap:14, active: undefined }}
+            onTouchStart={e => e.currentTarget.style.background = C.bgPanel}
+            onTouchEnd={e => e.currentTarget.style.background = C.bgCard}>
+            <div style={{ width:50, height:50, borderRadius:12, background:`${g.color}18`, border:`1px solid ${g.color}44`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:24, flexShrink:0 }}>{g.emoji}</div>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontSize:15, fontWeight:600, color:C.t1, marginBottom:3 }}>{g.title}</div>
+              <div style={{ fontSize:12, color:C.t3, marginBottom:6 }}>{g.desc}</div>
+              <span style={{ fontSize:10, fontWeight:600, padding:"2px 8px", borderRadius:10, background:`${g.color}18`, color:g.color, border:`1px solid ${g.color}30` }}>{g.tag}</span>
+            </div>
+            <Icon d={IC.arrowR} size={16} stroke={C.t3} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Tic-Tac-Toe ────────────────────────────────────────────────────────────────
+function GameTTT({ onBack }) {
+  const empty = Array(9).fill(null);
+  const [board, setBoard] = useState(empty);
+  const [xIsNext, setXIsNext] = useState(true);
+  const [mode, setMode] = useState("ai"); // "ai" | "2p"
+  const [scores, setScores] = useState({ X:0, O:0, D:0 });
+  const [winner, setWinner] = useState(null);
+
+  const lines = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+  const checkWin = b => { for (const [a,i,j] of lines) if (b[a] && b[a]===b[i] && b[a]===b[j]) return b[a]; return b.every(Boolean) ? "D" : null; };
+
+  const minimax = (b, isMax) => {
+    const w = checkWin(b);
+    if (w === "O") return 10; if (w === "X") return -10; if (w === "D") return 0;
+    const scores2 = [];
+    b.forEach((v,i) => { if (!v) { const nb = [...b]; nb[i] = isMax ? "O" : "X"; scores2.push(minimax(nb, !isMax)); } });
+    return isMax ? Math.max(...scores2) : Math.min(...scores2);
+  };
+  const bestMove = b => {
+    let best=-Infinity, idx=-1;
+    b.forEach((v,i) => { if (!v) { const nb=[...b]; nb[i]="O"; const s=minimax(nb,false); if(s>best){best=s;idx=i;} } });
+    return idx;
+  };
+
+  const handleClick = (i) => {
+    if (board[i] || winner) return;
+    const nb = [...board]; nb[i] = "X"; setBoard(nb);
+    const w = checkWin(nb);
+    if (w) { setWinner(w); setScores(s=>({...s,[w]:s[w]+1})); return; }
+    setXIsNext(false);
+    if (mode === "ai") {
+      setTimeout(() => {
+        const nb2 = [...nb]; nb2[bestMove(nb2)] = "O"; setBoard(nb2);
+        const w2 = checkWin(nb2);
+        if (w2) { setWinner(w2); setScores(s=>({...s,[w2]:s[w2]+1})); } else setXIsNext(true);
+      }, 300);
+    } else setXIsNext(true);
+  };
+  const handle2P = (i) => {
+    if (board[i] || winner) return;
+    const mark = xIsNext ? "X" : "O";
+    const nb = [...board]; nb[i] = mark; setBoard(nb);
+    const w = checkWin(nb);
+    if (w) { setWinner(w); setScores(s=>({...s,[w]:s[w]+1})); } else setXIsNext(!xIsNext);
+  };
+
+  const reset = () => { setBoard(empty); setXIsNext(true); setWinner(null); };
+  const winLine = lines.find(([a,i,j]) => board[a] && board[a]===board[i] && board[a]===board[j]);
+
+  return (
+    <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bgDeep }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"14px 16px", background:C.bgPanel, borderBottom:`1px solid ${C.border}` }}>
+        <button onClick={onBack} style={{ background:"none", border:"none", color:C.t2, cursor:"pointer", padding:"4px 8px 4px 0" }}><Icon d={IC.arrowL} size={18} /></button>
+        <div style={{ flex:1, fontSize:15, fontWeight:700, color:C.t1 }}>Tic-Tac-Toe</div>
+        <div style={{ display:"flex", gap:4 }}>
+          {["ai","2p"].map(m => <button key={m} onClick={() => { setMode(m); reset(); }} style={{ padding:"5px 12px", borderRadius:20, border:"none", fontSize:11, fontWeight:600, cursor:"pointer", background: mode===m ? C.blue : C.bgCard, color: mode===m ? "#fff" : C.t3 }}>{m==="ai"?"vs AI":"2P"}</button>)}
+        </div>
+      </div>
+      <div style={{ display:"flex", justifyContent:"center", gap:20, padding:"12px 16px", background:C.bgPanel }}>
+        {[["X",C.blue],["O",C.red]].map(([p,col]) => <div key={p} style={{ textAlign:"center" }}><div style={{ fontSize:20, fontWeight:800, color:col }}>{scores[p]}</div><div style={{ fontSize:10, color:C.t3 }}>{p==="X" ? "You" : mode==="ai"?"AI":"P2"}</div></div>)}
+        <div style={{ textAlign:"center" }}><div style={{ fontSize:20, fontWeight:800, color:C.t3 }}>{scores.D}</div><div style={{ fontSize:10, color:C.t3 }}>Draw</div></div>
+      </div>
+      <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:12, padding:16 }}>
+        <div style={{ width:"100%", maxWidth:300 }}>
+          {[0,1,2].map(row => (
+            <div key={row} style={{ display:"flex" }}>
+              {[0,1,2].map(col => {
+                const i = row*3+col;
+                const inWin = winLine?.includes(i);
+                return (
+                  <div key={col} onClick={() => mode==="ai" ? handleClick(i) : handle2P(i)} style={{
+                    flex:1, aspectRatio:"1", display:"flex", alignItems:"center", justifyContent:"center",
+                    fontSize:36, fontWeight:800, cursor: board[i]||winner ? "default" : "pointer",
+                    background: inWin ? (board[i]==="X" ? `${C.blue}28` : `${C.red}28`) : "transparent",
+                    color: board[i]==="X" ? C.blue : C.red,
+                    borderRight: col<2 ? `2px solid ${C.border}` : "none",
+                    borderBottom: row<2 ? `2px solid ${C.border}` : "none",
+                    transition: "background 0.2s",
+                  }}>{board[i] || ""}</div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+        <div style={{ fontSize:14, color:C.t2, minHeight:22, textAlign:"center" }}>
+          {winner ? (winner==="D" ? "It's a draw!" : `${winner==="X"?"You":mode==="ai"?"AI":"P2"} won! 🎉`) : `${xIsNext||mode==="2p" ? (mode==="2p" ? (xIsNext?"P1 (X)":"P2 (O)") : "Your turn (X)") : "AI thinking…"}`}
+        </div>
+        <button onClick={reset} style={{ padding:"10px 24px", borderRadius:10, border:"none", background:C.blue, color:"#fff", fontSize:13, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", gap:8 }}>
+          <Icon d={IC.restart} size={14} stroke="#fff" />New Game
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 2048 ────────────────────────────────────────────────────────────────────────
+function Game2048({ onBack }) {
+  const newGrid = () => { const g=Array(4).fill(null).map(()=>Array(4).fill(0)); addTile(g); addTile(g); return g; };
+  const addTile = (g) => { const emp=[]; g.forEach((r,i)=>r.forEach((v,j)=>{if(!v)emp.push([i,j]);})); if(!emp.length)return; const [i,j]=emp[Math.floor(Math.random()*emp.length)]; g[i][j]=Math.random()<0.9?2:4; };
+  const clone = g => g.map(r=>[...r]);
+  const [grid, setGrid] = useState(newGrid);
+  const [score, setScore] = useState(0);
+  const [best, setBest] = useState(0);
+  const [over, setOver] = useState(false);
+  const touchRef = useRef(null);
+
+  const slideRow = (row) => {
+    const r = row.filter(v=>v); let add=0;
+    for(let i=0;i<r.length-1;i++) if(r[i]===r[i+1]){r[i]*=2;add+=r[i];r.splice(i+1,1);}
+    while(r.length<4)r.push(0);
+    return {row:r, gained:add};
+  };
+
+  const move = useCallback((dir) => {
+    if (over) return;
+    const g = clone(grid); let gained=0, moved=false;
+    const process = rows => rows.map(row => { const {row:r,gained:g2}=slideRow(row); gained+=g2; if(r.join()!==row.join())moved=true; return r; });
+    let rows;
+    if (dir==="L") rows = process(g);
+    else if (dir==="R") rows = process(g.map(r=>[...r].reverse())).map(r=>[...r].reverse());
+    else if (dir==="U") { const t=g[0].map((_,i)=>g.map(r=>r[i])); const p=process(t); rows=p[0].map((_,i)=>p.map(r=>r[i])); }
+    else { const t=g[0].map((_,i)=>g.map(r=>r[i]).reverse()); const p=process(t); rows=p[0].map((_,i)=>p.map(r=>r[i]).reverse()); }
+    if (!moved) return;
+    addTile(rows);
+    const ns = score + gained;
+    setGrid(rows); setScore(ns); if(ns>best)setBest(ns);
+    const emp = rows.some(r=>r.some(v=>!v));
+    if (!emp) {
+      const canMove = rows.some((r,i)=>r.some((v,j)=>(j<3&&v===r[j+1])||(i<3&&v===rows[i+1][j])));
+      if(!canMove) setOver(true);
+    }
+  }, [grid, score, best, over]);
+
+  useEffect(() => {
+    const handler = e => { const k={ArrowLeft:"L",ArrowRight:"R",ArrowUp:"U",ArrowDown:"D"}[e.key]; if(k){e.preventDefault();move(k);} };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [move]);
+
+  const COLORS = {0:"#1e3a5f",2:"#3b82f6",4:"#2563eb",8:"#7c3aed",16:"#9333ea",32:"#ec4899",64:"#ef4444",128:"#f97316",256:"#f59e0b",512:"#22c55e",1024:"#06b6d4",2048:"#ffd700"};
+  const tileColor = v => COLORS[v] || "#ffd700";
+
+  return (
+    <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bgDeep }}
+      onTouchStart={e => { touchRef.current = {x:e.touches[0].clientX, y:e.touches[0].clientY}; }}
+      onTouchEnd={e => {
+        if (!touchRef.current) return;
+        const dx=e.changedTouches[0].clientX-touchRef.current.x, dy=e.changedTouches[0].clientY-touchRef.current.y;
+        if(Math.abs(dx)>Math.abs(dy)){move(dx>0?"R":"L");}else{move(dy>0?"D":"U");}
+        touchRef.current=null;
+      }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"14px 16px", background:C.bgPanel, borderBottom:`1px solid ${C.border}` }}>
+        <button onClick={onBack} style={{ background:"none", border:"none", color:C.t2, cursor:"pointer", padding:"4px 8px 4px 0" }}><Icon d={IC.arrowL} size={18} /></button>
+        <div style={{ flex:1, fontSize:15, fontWeight:700, color:C.t1 }}>2048</div>
+        <div style={{ display:"flex", gap:8 }}>
+          {[["Score",score],["Best",best]].map(([l,v])=><div key={l} style={{ textAlign:"center", padding:"4px 10px", background:C.bgCard, borderRadius:8 }}><div style={{ fontSize:13, fontWeight:700, color:C.t1 }}>{v}</div><div style={{ fontSize:9, color:C.t3 }}>{l}</div></div>)}
+        </div>
+        <button onClick={() => { setGrid(newGrid()); setScore(0); setOver(false); }} style={{ background:C.blue, border:"none", borderRadius:8, color:"#fff", fontSize:11, fontWeight:600, padding:"6px 10px", cursor:"pointer" }}>New</button>
+      </div>
+      <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:16, gap:8 }}>
+        {over && <div style={{ fontSize:18, fontWeight:700, color:C.amber, marginBottom:8 }}>Game Over! 🎮</div>}
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8, width:"100%", maxWidth:340, background:C.bgCard, borderRadius:12, padding:8 }}>
+          {grid.flat().map((v,i) => (
+            <div key={i} style={{ aspectRatio:"1", borderRadius:8, background:v?tileColor(v):C.bgDeep, display:"flex", alignItems:"center", justifyContent:"center", fontSize:v>=1000?16:v>=100?20:v>=10?24:28, fontWeight:800, color:"#fff", transition:"all 0.1s" }}>
+              {v||""}
+            </div>
+          ))}
+        </div>
+        <div style={{ fontSize:11, color:C.t3, marginTop:4 }}>Swipe to move tiles</div>
+      </div>
+    </div>
+  );
+}
+
+// ── Memory Match ───────────────────────────────────────────────────────────────
+function GameMemory({ onBack }) {
+  const EMOJIS = ["🐶","🐱","🦊","🐻","🐼","🐨","🦁","🐯","🦋","🌸","⭐","🎸","🍕","🚀","🎮","🌈"];
+  const makeCards = () => {
+    const pairs = [...EMOJIS,...EMOJIS].map((e,i)=>({id:i,emoji:e,flipped:false,matched:false}));
+    for(let i=pairs.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[pairs[i],pairs[j]]=[pairs[j],pairs[i]];}
+    return pairs;
+  };
+  const [cards, setCards]   = useState(makeCards);
+  const [flipped, setFlipped] = useState([]);
+  const [moves, setMoves]   = useState(0);
+  const [mode, setMode]     = useState("1p"); // "1p"|"2p"
+  const [turn, setTurn]     = useState(1);
+  const [scores, setScores] = useState({1:0,2:0});
+  const [locked, setLocked] = useState(false);
+  const [done, setDone]     = useState(false);
+
+  const flip = (id) => {
+    if (locked || done) return;
+    const card = cards.find(c=>c.id===id);
+    if (!card || card.flipped || card.matched) return;
+    const nf = [...flipped, id];
+    setCards(c=>c.map(x=>x.id===id?{...x,flipped:true}:x));
+    if (nf.length === 2) {
+      setMoves(m=>m+1); setLocked(true);
+      const [a,b] = nf.map(i=>cards.find(c=>c.id===i));
+      if (a.emoji === b.emoji) {
+        setCards(c=>c.map(x=>nf.includes(x.id)?{...x,matched:true}:x));
+        const ns = {...scores, [turn]:scores[turn]+1};
+        setScores(ns);
+        setFlipped([]); setLocked(false);
+        if(ns[1]+ns[2]===EMOJIS.length) setDone(true);
+      } else {
+        setTimeout(() => {
+          setCards(c=>c.map(x=>nf.includes(x.id)?{...x,flipped:false}:x));
+          setFlipped([]); setLocked(false);
+          if(mode==="2p") setTurn(t=>t===1?2:1);
+        }, 900);
+      }
+      nf.length===1 && setFlipped(nf);
+    } else setFlipped(nf);
+  };
+
+  const reset = () => { setCards(makeCards()); setFlipped([]); setMoves(0); setTurn(1); setScores({1:0,2:0}); setLocked(false); setDone(false); };
+
+  return (
+    <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bgDeep, overflow:"hidden" }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"14px 16px", background:C.bgPanel, borderBottom:`1px solid ${C.border}`, flexShrink:0 }}>
+        <button onClick={onBack} style={{ background:"none", border:"none", color:C.t2, cursor:"pointer", padding:"4px 8px 4px 0" }}><Icon d={IC.arrowL} size={18} /></button>
+        <div style={{ flex:1, fontSize:15, fontWeight:700, color:C.t1 }}>Memory Match</div>
+        <div style={{ display:"flex", gap:4 }}>
+          {["1p","2p"].map(m=><button key={m} onClick={()=>{setMode(m);reset();}} style={{ padding:"5px 12px", borderRadius:20, border:"none", fontSize:11, fontWeight:600, cursor:"pointer", background:mode===m?C.blue:C.bgCard, color:mode===m?"#fff":C.t3 }}>{m==="1p"?"Solo":"2P"}</button>)}
+        </div>
+      </div>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"10px 16px", background:C.bgPanel, flexShrink:0 }}>
+        {mode==="2p" ? (
+          <>{[1,2].map(p=><div key={p} style={{ display:"flex", alignItems:"center", gap:8 }}><div style={{ width:8,height:8,borderRadius:"50%",background:turn===p&&!done?C.green:"transparent",border:`2px solid ${p===1?C.blue:C.purple}` }} /><span style={{ fontSize:12, color:p===1?C.blue:C.purple, fontWeight:600 }}>P{p}: {scores[p]}</span></div>)}</>
+        ) : (
+          <span style={{ fontSize:12, color:C.t2 }}>Pairs: {scores[1]}/{EMOJIS.length}</span>
+        )}
+        <span style={{ fontSize:12, color:C.t3 }}>Moves: {moves}</span>
+        <button onClick={reset} style={{ background:C.blue, border:"none", borderRadius:8, color:"#fff", fontSize:11, fontWeight:600, padding:"6px 10px", cursor:"pointer" }}>New</button>
+      </div>
+      {done && <div style={{ padding:"10px 16px", background:`${C.green}18`, borderBottom:`1px solid ${C.green}30`, textAlign:"center", fontSize:13, color:C.green, fontWeight:600, flexShrink:0 }}>
+        {mode==="2p" ? (scores[1]>scores[2]?"P1 wins! 🎉":scores[2]>scores[1]?"P2 wins! 🎉":"It's a tie! 🤝") : "You matched them all! 🎉"}
+      </div>}
+      {mode==="2p"&&!done&&<div style={{ padding:"6px 16px", background:`${C.bgCard}`, borderBottom:`1px solid ${C.border}`, textAlign:"center", fontSize:12, color:turn===1?C.blue:C.purple, fontWeight:600, flexShrink:0 }}>Player {turn}'s turn</div>}
+      <div style={{ flex:1, overflowY:"auto", padding:"10px 12px" }}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8 }}>
+          {cards.map(card => (
+            <div key={card.id} onClick={() => flip(card.id)} style={{
+              aspectRatio:"1", borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:24,
+              background: card.matched ? `${C.green}18` : card.flipped ? C.bgCard : C.bgPanel,
+              border: `1px solid ${card.matched ? C.green : card.flipped ? C.borderHi : C.border}`,
+              cursor: card.matched||card.flipped ? "default" : "pointer",
+              transition:"all 0.2s",
+            }}>
+              {(card.flipped||card.matched) ? card.emoji : "❓"}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Rock Paper Scissors ────────────────────────────────────────────────────────
+function GameRPS({ onBack }) {
+  const CHOICES = [{id:"rock",emoji:"✊",beats:"scissors"},{id:"scissors",emoji:"✌️",beats:"paper"},{id:"paper",emoji:"🖐️",beats:"rock"}];
+  const [playerScore, setPlayerScore] = useState(0);
+  const [aiScore, setAiScore]         = useState(0);
+  const [round, setRound]             = useState(1);
+  const [result, setResult]           = useState(null); // { player, ai, outcome }
+  const [done, setDone]               = useState(false);
+  const ROUNDS = 5;
+
+  const play = (choice) => {
+    if (done) return;
+    const ai = CHOICES[Math.floor(Math.random()*3)];
+    const player = CHOICES.find(c=>c.id===choice);
+    let outcome;
+    if (player.id === ai.id) outcome = "draw";
+    else if (player.beats === ai.id) outcome = "win";
+    else outcome = "lose";
+    const np = playerScore + (outcome==="win"?1:0);
+    const na = aiScore + (outcome==="lose"?1:0);
+    setPlayerScore(np); setAiScore(na);
+    setResult({player, ai, outcome});
+    const nr = round + 1;
+    setRound(nr);
+    if (nr > ROUNDS) setDone(true);
+  };
+
+  const reset = () => { setPlayerScore(0); setAiScore(0); setRound(1); setResult(null); setDone(false); };
+
+  return (
+    <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bgDeep }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"14px 16px", background:C.bgPanel, borderBottom:`1px solid ${C.border}` }}>
+        <button onClick={onBack} style={{ background:"none", border:"none", color:C.t2, cursor:"pointer", padding:"4px 8px 4px 0" }}><Icon d={IC.arrowL} size={18} /></button>
+        <div style={{ flex:1, fontSize:15, fontWeight:700, color:C.t1 }}>Rock Paper Scissors</div>
+        <span style={{ fontSize:11, color:C.t3 }}>Best of {ROUNDS}</span>
+      </div>
+      <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:24, gap:20 }}>
+        <div style={{ display:"flex", gap:28, alignItems:"center" }}>
+          <div style={{ textAlign:"center" }}><div style={{ fontSize:32, fontWeight:800, color:C.blue }}>{playerScore}</div><div style={{ fontSize:11, color:C.t3 }}>You</div></div>
+          <div style={{ fontSize:14, color:C.t3, fontWeight:600 }}>Round {Math.min(round,ROUNDS)}/{ROUNDS}</div>
+          <div style={{ textAlign:"center" }}><div style={{ fontSize:32, fontWeight:800, color:C.red }}>{aiScore}</div><div style={{ fontSize:11, color:C.t3 }}>AI</div></div>
+        </div>
+        {result && (
+          <div style={{ textAlign:"center", padding:"16px 24px", background:C.bgCard, borderRadius:14, border:`1px solid ${C.border}`, width:"100%" }}>
+            <div style={{ fontSize:36, marginBottom:6 }}>{result.player.emoji} vs {result.ai.emoji}</div>
+            <div style={{ fontSize:15, fontWeight:700, color: result.outcome==="win"?C.green:result.outcome==="lose"?C.red:C.amber }}>
+              {result.outcome==="win"?"You win this round! 🎉":result.outcome==="lose"?"AI wins this round":"Draw!"}
+            </div>
+          </div>
+        )}
+        {done ? (
+          <div style={{ textAlign:"center", width:"100%" }}>
+            <div style={{ fontSize:20, fontWeight:800, color: playerScore>aiScore?C.green:aiScore>playerScore?C.red:C.amber, marginBottom:16 }}>
+              {playerScore>aiScore?"You won! 🏆":aiScore>playerScore?"AI won 🤖":"It's a tie! 🤝"}
+            </div>
+            <button onClick={reset} style={{ padding:"12px 32px", borderRadius:12, border:"none", background:C.blue, color:"#fff", fontSize:14, fontWeight:700, cursor:"pointer" }}>Play Again</button>
+          </div>
+        ) : (
+          <div style={{ display:"flex", gap:12, width:"100%" }}>
+            {CHOICES.map(c => (
+              <button key={c.id} onClick={() => play(c.id)} style={{ flex:1, padding:"18px 8px", borderRadius:14, border:`1px solid ${C.border}`, background:C.bgCard, cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:6, fontSize:32, WebkitTapHighlightColor:"transparent" }}>
+                {c.emoji}<span style={{ fontSize:10, color:C.t3, textTransform:"capitalize" }}>{c.id}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Snake ──────────────────────────────────────────────────────────────────────
+function GameSnake({ onBack }) {
+  const COLS=20, ROWS=18, CELL=16;
+  const initState = () => ({ snake:[{x:10,y:9},{x:9,y:9},{x:8,y:9}], dir:{x:1,y:0}, food:randFood([{x:10,y:9}]), alive:true, score:0 });
+  function randFood(snake) { let p; do { p={x:Math.floor(Math.random()*COLS),y:Math.floor(Math.random()*ROWS)}; } while(snake.some(s=>s.x===p.x&&s.y===p.y)); return p; }
+  const [state, setState] = useState(initState);
+  const dirRef = useRef({x:1,y:0});
+  const stateRef = useRef(state);
+  const touchRef = useRef(null);
+  const [running, setRunning] = useState(false);
+  const [best, setBest] = useState(0);
+  stateRef.current = state;
+
+  const step = useCallback(() => {
+    setState(prev => {
+      if (!prev.alive) return prev;
+      const d = dirRef.current;
+      const head = {x:(prev.snake[0].x+d.x+COLS)%COLS, y:(prev.snake[0].y+d.y+ROWS)%ROWS};
+      if (prev.snake.some(s=>s.x===head.x&&s.y===head.y)) return {...prev, alive:false};
+      const ate = head.x===prev.food.x && head.y===prev.food.y;
+      const snake = [head, ...prev.snake.slice(0, ate?undefined:-1)];
+      const score = prev.score + (ate?10:0);
+      if (score>best) setBest(score);
+      return {...prev, snake, food: ate?randFood(snake):prev.food, score};
+    });
+  }, [best]);
+
+  useEffect(() => {
+    if (!running || !state.alive) return;
+    const id = setInterval(step, 110);
+    return () => clearInterval(id);
+  }, [running, state.alive, step]);
+
+  useEffect(() => {
+    const h = e => {
+      const map={ArrowUp:{x:0,y:-1},ArrowDown:{x:0,y:1},ArrowLeft:{x:-1,y:0},ArrowRight:{x:1,y:0}};
+      const d=map[e.key]; if(d){e.preventDefault(); const c=dirRef.current; if(c.x!==(-d.x)||c.y!==(-d.y)) dirRef.current=d;}
+    };
+    window.addEventListener("keydown",h); return ()=>window.removeEventListener("keydown",h);
+  }, []);
+
+  const reset = () => { const s=initState(); dirRef.current={x:1,y:0}; setState(s); setRunning(true); };
+
+  return (
+    <div style={{ flex:1, display:"flex", flexDirection:"column", background:C.bgDeep }}
+      onTouchStart={e=>{touchRef.current={x:e.touches[0].clientX,y:e.touches[0].clientY};}}
+      onTouchEnd={e=>{
+        if(!touchRef.current)return;
+        const dx=e.changedTouches[0].clientX-touchRef.current.x, dy=e.changedTouches[0].clientY-touchRef.current.y;
+        const c=dirRef.current;
+        if(Math.abs(dx)>Math.abs(dy)){const d=dx>0?{x:1,y:0}:{x:-1,y:0}; if(c.x!==(-d.x))dirRef.current=d;}
+        else{const d=dy>0?{x:0,y:1}:{x:0,y:-1}; if(c.y!==(-d.y))dirRef.current=d;}
+        touchRef.current=null;
+      }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"14px 16px", background:C.bgPanel, borderBottom:`1px solid ${C.border}` }}>
+        <button onClick={onBack} style={{ background:"none", border:"none", color:C.t2, cursor:"pointer", padding:"4px 8px 4px 0" }}><Icon d={IC.arrowL} size={18} /></button>
+        <div style={{ flex:1, fontSize:15, fontWeight:700, color:C.t1 }}>Snake</div>
+        <div style={{ display:"flex", gap:12 }}>
+          <span style={{ fontSize:12, color:C.t2 }}>Score: <b style={{ color:C.t1 }}>{state.score}</b></span>
+          <span style={{ fontSize:12, color:C.t3 }}>Best: {best}</span>
+        </div>
+      </div>
+      <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:12, gap:10 }}>
+        {!running && !state.alive && state.score>0 && <div style={{ fontSize:16, fontWeight:700, color:C.red, marginBottom:4 }}>Game Over! Score: {state.score}</div>}
+        <div style={{ position:"relative", background:C.bgCard, borderRadius:10, border:`1px solid ${C.border}`, overflow:"hidden", width:COLS*CELL, height:ROWS*CELL, flexShrink:0 }}>
+          {state.snake.map((s,i) => <div key={i} style={{ position:"absolute", left:s.x*CELL, top:s.y*CELL, width:CELL, height:CELL, borderRadius: i===0?4:2, background: i===0?C.green:`${C.green}${i===1?"dd":"88"}` }} />)}
+          <div style={{ position:"absolute", left:state.food.x*CELL, top:state.food.y*CELL, width:CELL, height:CELL, borderRadius:CELL/2, background:C.red }} />
+          {!running && <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(6,17,30,0.8)" }}>
+            <button onClick={reset} style={{ padding:"12px 28px", borderRadius:12, border:"none", background:C.green, color:"#fff", fontSize:14, fontWeight:700, cursor:"pointer" }}>{state.score>0?"Restart":"Start Game"}</button>
+          </div>}
+          {!state.alive && running && <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", background:"rgba(6,17,30,0.85)", gap:12 }}>
+            <div style={{ fontSize:16, fontWeight:700, color:C.red }}>Game Over!</div>
+            <button onClick={reset} style={{ padding:"10px 24px", borderRadius:10, border:"none", background:C.green, color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer" }}>Play Again</button>
+          </div>}
+        </div>
+        {running && state.alive && <div style={{ fontSize:11, color:C.t3 }}>Swipe or use arrow keys to steer</div>}
+        {running && state.alive && (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,44px)", gap:4 }}>
+            {[["↑","U",1,0],["←","L",0,1],["↓","D",2,1],["→","R",2,2]].map(([label,_,r,c])=>(
+              <button key={label} onClick={()=>{
+                const map={U:{x:0,y:-1},D:{x:0,y:1},L:{x:-1,y:0},R:{x:1,y:0}};
+                const d=map[_]; const cur=dirRef.current; if(cur.x!==(-d.x)||cur.y!==(-d.y))dirRef.current=d;
+              }} style={{ gridRow:r, gridColumn:c+1, width:44, height:44, borderRadius:10, border:`1px solid ${C.border}`, background:C.bgCard, color:C.t1, fontSize:18, cursor:"pointer", WebkitTapHighlightColor:"transparent" }}>{label}</button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Root: Clerk auth gate ────────────────────────────────────────────────────
+// ─── WAV encoder ──────────────────────────────────────────────────────────────
+function audioBufferToWav(buffer) {
+  const numCh = buffer.numberOfChannels, sr = buffer.sampleRate;
+  const dataSize = buffer.length * numCh * 2;
+  const ab = new ArrayBuffer(44 + dataSize);
+  const v = new DataView(ab);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0,"RIFF"); v.setUint32(4,36+dataSize,true); ws(8,"WAVE");
+  ws(12,"fmt "); v.setUint32(16,16,true); v.setUint16(20,1,true);
+  v.setUint16(22,numCh,true); v.setUint32(24,sr,true);
+  v.setUint32(28,sr*numCh*2,true); v.setUint16(32,numCh*2,true);
+  v.setUint16(34,16,true); ws(36,"data"); v.setUint32(40,dataSize,true);
+  let offset = 44;
+  for (let i = 0; i < buffer.length; i++)
+    for (let ch = 0; ch < numCh; ch++) {
+      const s = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
+      v.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+  return ab;
+}
+
+// ─── Music Studio (mobile-only panel) ─────────────────────────────────────────
+// ─── Mood definitions for generative music ────────────────────────────────────
+const MOODS = {
+  happy:     { label:"Happy",     emoji:"😄", bpm:124, key:261.63, wave:"triangle", color:"#f59e0b", notes:[0,4,7,9,7,4,2,4],  rhythm:[1,0,1,0,1,1,0,1], filterHz:2000, reverbMix:0.1 },
+  sad:       { label:"Sad",       emoji:"😢", bpm:58,  key:220,    wave:"sine",     color:"#3b82f6", notes:[0,3,5,7,5,3,0,3],  rhythm:[1,0,0,1,0,0,1,0], filterHz:800,  reverbMix:0.4 },
+  energetic: { label:"Energetic", emoji:"⚡", bpm:148, key:293.66, wave:"sawtooth", color:"#ef4444", notes:[0,0,7,0,5,7,9,0],  rhythm:[1,1,1,1,1,1,1,1], filterHz:3000, reverbMix:0.05 },
+  calm:      { label:"Calm",      emoji:"🌿", bpm:68,  key:174.61, wave:"sine",     color:"#22c55e", notes:[0,4,7,9,7,9,7,4],  rhythm:[1,0,0,0,1,0,0,0], filterHz:600,  reverbMix:0.5 },
+  dark:      { label:"Dark",      emoji:"🌑", bpm:88,  key:146.83, wave:"sawtooth", color:"#a855f7", notes:[0,3,6,10,8,6,3,0], rhythm:[1,0,1,1,0,1,0,1], filterHz:500,  reverbMix:0.6 },
+  romantic:  { label:"Romantic",  emoji:"💗", bpm:76,  key:196,    wave:"triangle", color:"#ec4899", notes:[4,7,9,12,9,7,4,7], rhythm:[1,0,0,1,0,0,1,0], filterHz:1200, reverbMix:0.35 },
+};
+const SEMITONE = Math.pow(2, 1/12);
+const noteFreq = (base, semitones) => base * Math.pow(SEMITONE, semitones);
+
+function MusicStudio() {
+  const [tracks, setTracks]       = useState([]);
+  const [playing, setPlaying]     = useState(false);
+  const [masterVol, setMasterVol] = useState(0.85);
+  const [exportUrl, setExportUrl] = useState(null);
+  const [exporting, setExporting] = useState(false);
+  const [studioTab, setStudioTab]   = useState("mashup"); // "mashup" | "generate"
+  // AI Music Generation state
+  const [mgStatus, setMgStatus]     = useState("idle"); // idle | loading-model | generating | playing | done | error
+  const [mgProgress, setMgProgress] = useState(0);
+  const [mgProgressText, setMgProgressText] = useState("");
+  const [mgPrompt, setMgPrompt]     = useState("");
+  const [mgDuration, setMgDuration] = useState(10); // seconds (mapped to tokens)
+  const [mgAudioUrl, setMgAudioUrl] = useState(null);
+  const mgEngineRef = useRef(null);
+  const mgSrcRef    = useRef(null);
+  const mgCtxRef    = useRef(null);
+  // Keep old mood state for oscillator fallback (not shown in UI but needed for export)
+  const [selMood, setSelMood]     = useState("happy");
+  const [genPlaying, setGenPlaying] = useState(false);
+  const [genExportUrl, setGenExportUrl] = useState(null);
+  const [genExporting, setGenExporting] = useState(false);
+  const audioCtxRef  = useRef(null);
+  const srcNodesRef  = useRef([]);
+  const gainNodesRef = useRef([]);
+  const masterRef    = useRef(null);
+  const genNodesRef  = useRef([]); // oscillators for generative playback
+  const genIntervalRef = useRef(null);
+
+  const getCtx = () => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      masterRef.current = audioCtxRef.current.createGain();
+      masterRef.current.connect(audioCtxRef.current.destination);
+    }
+    return audioCtxRef.current;
+  };
+
+  const loadFiles = async (e) => {
+    const ctx = getCtx();
+    for (const file of [...e.target.files]) {
+      const buf = await file.arrayBuffer();
+      try {
+        const decoded = await ctx.decodeAudioData(buf);
+        setTracks(prev => [...prev, {
+          id: Date.now() + Math.random(),
+          name: file.name.replace(/\.[^.]+$/, ""),
+          buffer: decoded,
+          volume: 0.85,
+          duration: decoded.duration,
+        }]);
+      } catch {}
+    }
+    e.target.value = "";
+  };
+
+  const stopAll = () => {
+    srcNodesRef.current.forEach(s => { try { s.stop(); } catch {} });
+    srcNodesRef.current = [];
+    gainNodesRef.current = [];
+    setPlaying(false);
+  };
+
+  const playMix = () => {
+    if (playing) { stopAll(); return; }
+    if (!tracks.length) return;
+    const ctx = getCtx();
+    if (ctx.state === "suspended") ctx.resume();
+    stopAll();
+    masterRef.current.gain.value = masterVol;
+    tracks.forEach(t => {
+      const src = ctx.createBufferSource();
+      src.buffer = t.buffer; src.loop = true;
+      const gain = ctx.createGain();
+      gain.gain.value = t.volume;
+      src.connect(gain); gain.connect(masterRef.current);
+      src.start(0);
+      srcNodesRef.current.push(src);
+      gainNodesRef.current.push({ id: t.id, node: gain });
+    });
+    setPlaying(true);
+  };
+
+  useEffect(() => {
+    gainNodesRef.current.forEach(({ id, node }) => {
+      const t = tracks.find(x => x.id === id);
+      if (t) node.gain.value = t.volume;
+    });
+  }, [tracks]);
+
+  useEffect(() => {
+    if (masterRef.current) masterRef.current.gain.value = masterVol;
+  }, [masterVol]);
+
+  const exportMix = async () => {
+    if (!tracks.length) return;
+    setExporting(true);
+    const duration = Math.min(Math.max(...tracks.map(t => t.buffer.duration)), 300);
+    const offCtx = new OfflineAudioContext(2, Math.ceil(44100 * duration), 44100);
+    const master = offCtx.createGain();
+    master.gain.value = masterVol;
+    master.connect(offCtx.destination);
+    tracks.forEach(t => {
+      const src = offCtx.createBufferSource();
+      src.buffer = t.buffer;
+      const gain = offCtx.createGain();
+      gain.gain.value = t.volume;
+      src.connect(gain); gain.connect(master);
+      src.start(0);
+    });
+    try {
+      const rendered = await offCtx.startRendering();
+      const blob = new Blob([audioBufferToWav(rendered)], { type: "audio/wav" });
+      if (exportUrl) URL.revokeObjectURL(exportUrl);
+      setExportUrl(URL.createObjectURL(blob));
+    } catch {}
+    setExporting(false);
+  };
+
+  // ── Mood generation ────────────────────────────────────────────────────────
+  const stopGen = () => {
+    genNodesRef.current.forEach(n => { try { n.stop?.(); n.disconnect?.(); } catch {} });
+    genNodesRef.current = [];
+    if (genIntervalRef.current) { clearInterval(genIntervalRef.current); genIntervalRef.current = null; }
+    setGenPlaying(false);
+  };
+
+  const playMood = () => {
+    if (genPlaying) { stopGen(); return; }
+    const ctx = getCtx();
+    if (ctx.state === "suspended") ctx.resume();
+    stopGen();
+    const mood = MOODS[selMood];
+    const beatDur = 60 / mood.bpm;
+    let step = 0;
+
+    const playStep = () => {
+      if (!mood.rhythm[step % mood.rhythm.length]) { step++; return; }
+      const freq = noteFreq(mood.key, mood.notes[step % mood.notes.length]);
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const filt = ctx.createBiquadFilter();
+
+      osc.type = mood.wave;
+      osc.frequency.value = freq;
+      filt.type = "lowpass";
+      filt.frequency.value = mood.filterHz;
+      gain.gain.setValueAtTime(0.4, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + beatDur * 0.8);
+
+      osc.connect(filt); filt.connect(gain); gain.connect(masterRef.current);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + beatDur * 0.8);
+      genNodesRef.current.push(osc);
+      step++;
+    };
+
+    playStep();
+    genIntervalRef.current = setInterval(playStep, beatDur * 1000);
+    setGenPlaying(true);
+  };
+
+  const exportMoodMix = async () => {
+    const mood = MOODS[selMood];
+    setGenExporting(true);
+    const bars = 8, beatDur = 60 / mood.bpm;
+    const totalDur = bars * mood.notes.length * beatDur;
+    const offCtx = new OfflineAudioContext(2, Math.ceil(44100 * totalDur), 44100);
+    const master = offCtx.createGain();
+    master.gain.value = masterVol;
+    master.connect(offCtx.destination);
+
+    let t = 0;
+    for (let bar = 0; bar < bars; bar++) {
+      for (let i = 0; i < mood.notes.length; i++) {
+        if (mood.rhythm[i % mood.rhythm.length]) {
+          const freq = noteFreq(mood.key, mood.notes[i]);
+          const osc  = offCtx.createOscillator();
+          const gain = offCtx.createGain();
+          const filt = offCtx.createBiquadFilter();
+          osc.type = mood.wave;
+          osc.frequency.value = freq;
+          filt.type = "lowpass"; filt.frequency.value = mood.filterHz;
+          gain.gain.setValueAtTime(0.4, t);
+          gain.gain.exponentialRampToValueAtTime(0.001, t + beatDur * 0.8);
+          osc.connect(filt); filt.connect(gain); gain.connect(master);
+          osc.start(t); osc.stop(t + beatDur * 0.8);
+        }
+        t += beatDur;
+      }
+    }
+    try {
+      const rendered = await offCtx.startRendering();
+      const blob = new Blob([audioBufferToWav(rendered)], { type: "audio/wav" });
+      if (genExportUrl) URL.revokeObjectURL(genExportUrl);
+      setGenExportUrl(URL.createObjectURL(blob));
+    } catch {}
+    setGenExporting(false);
+  };
+
+  // ── AI Music Generation (MusicGen via @huggingface/transformers) ─────────────
+  const MOOD_PROMPTS = {
+    happy:     "upbeat happy pop music with bright piano and catchy melody",
+    sad:       "melancholic sad piano ballad with soft strings and slow tempo",
+    energetic: "high energy electronic dance music with heavy bass and driving beat",
+    calm:      "peaceful ambient music with soft pads and gentle acoustic guitar",
+    dark:      "dark cinematic music with deep bass, tension and mysterious atmosphere",
+    romantic:  "romantic soft jazz with warm piano and gentle acoustic guitar",
+    epic:      "epic orchestral film score with soaring strings and powerful drums",
+    lofi:      "lo-fi hip hop beats with warm vinyl crackle and relaxed groove",
+  };
+
+  const generateMusic = async () => {
+    if (mgStatus === "playing") {
+      mgSrcRef.current?.stop();
+      mgSrcRef.current = null;
+      setMgStatus("done");
+      return;
+    }
+    setMgStatus("loading-model");
+    setMgProgress(0);
+    setMgProgressText("Loading MusicGen AI model (one-time ~300MB download)…");
+    try {
+      if (!mgEngineRef.current) {
+        mgEngineRef.current = await pipeline("text-to-audio", "Xenova/musicgen-small", {
+          progress_callback: (p) => {
+            if (p.status === "downloading" || p.status === "loading") {
+              const pct = p.progress ? Math.round(p.progress) : 0;
+              setMgProgress(pct);
+              setMgProgressText(`${p.status === "loading" ? "Loading" : "Downloading"} model${p.file ? ` (${p.file.split("/").pop()})` : ""}… ${pct}%`);
+            } else if (p.status === "ready") {
+              setMgProgressText("Model ready ✓");
+            }
+          },
+        });
+      }
+      setMgStatus("generating");
+      setMgProgressText("Generating music…");
+      const prompt = mgPrompt.trim() || MOOD_PROMPTS[selMood] || "upbeat happy music";
+      const tokensPerSec = 50;
+      const maxTokens = Math.min(Math.max(mgDuration * tokensPerSec, 100), 1500);
+      const output = await mgEngineRef.current(prompt, {
+        max_new_tokens: maxTokens,
+        do_sample: true,
+        guidance_scale: 3,
+      });
+      // output[0].audio = Float32Array, output[0].sampling_rate = number
+      const sampleRate = output[0].sampling_rate;
+      const audioData  = output[0].audio;
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      mgCtxRef.current = ctx;
+      const buf = ctx.createBuffer(1, audioData.length, sampleRate);
+      buf.getChannelData(0).set(audioData);
+      // Also create downloadable URL
+      const wavBlob = new Blob([audioBufferToWav(buf)], { type: "audio/wav" });
+      if (mgAudioUrl) URL.revokeObjectURL(mgAudioUrl);
+      setMgAudioUrl(URL.createObjectURL(wavBlob));
+      // Auto-play
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.onended = () => setMgStatus("done");
+      src.start(0);
+      mgSrcRef.current = src;
+      setMgStatus("playing");
+      setMgProgressText("");
+    } catch (err) {
+      setMgStatus("error");
+      setMgProgressText(`Error: ${err.message || err}`);
+    }
+  };
+
+  const GRAD = [
+    ["#3b82f6","#38bdf8"],["#a855f7","#3b82f6"],["#22c55e","#38bdf8"],
+    ["#f59e0b","#ef4444"],["#ef4444","#a855f7"],["#38bdf8","#22c55e"],
+  ];
+  const fmtDur = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,"0")}`;
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", background: C.bgDeep, overflow: "hidden" }}>
+      {/* Header */}
+      <div style={{ padding: "16px 16px 12px", background: C.bgPanel, borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+          <div style={{ width: 38, height: 38, borderRadius: 11, background: `linear-gradient(135deg,${C.purple},${C.blue})`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            <Icon d={IC.music} size={18} stroke="#fff" />
+          </div>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: C.t1 }}>Music Studio</div>
+            <div style={{ fontSize: 11, color: C.t3 }}>Mix & mashup your songs · 100% offline</div>
+          </div>
+        </div>
+        {/* Tab switcher */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+          {[["mashup","🎛 Mashup"],["generate","✨ Generate"]].map(([id, label]) => (
+            <button key={id} onClick={() => setStudioTab(id)} style={{ flex: 1, padding: "8px", borderRadius: 9, border: `1px solid ${studioTab===id ? C.blue : C.border}`, background: studioTab===id ? "rgba(59,130,246,0.15)" : C.bgCard, color: studioTab===id ? C.blue : C.t2, fontSize: 12.5, fontWeight: studioTab===id ? 700 : 400, cursor: "pointer", WebkitTapHighlightColor: "transparent" }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {studioTab === "mashup" && (
+          <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "11px", background: C.blue, borderRadius: 10, color: "#fff", fontSize: 13, fontWeight: 600, cursor: "pointer", WebkitTapHighlightColor: "transparent" }}>
+            <Icon d={IC.plus} size={15} stroke="#fff" /> Add Tracks (MP3 / WAV)
+            <input type="file" accept="audio/*" multiple onChange={loadFiles} style={{ display: "none" }} />
+          </label>
+        )}
+      </div>
+
+      {/* ── AI Generate (MusicGen — like Lyria) ── */}
+      {studioTab === "generate" && (
+        <div style={{ flex: 1, overflowY: "auto", padding: "14px", WebkitOverflowScrolling: "touch" }}>
+
+          {/* Hero badge */}
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:14, padding:"10px 12px", background:"rgba(168,85,247,0.08)", border:"1px solid rgba(168,85,247,0.2)", borderRadius:10 }}>
+            <span style={{ fontSize:18 }}>🎵</span>
+            <div>
+              <div style={{ fontSize:12, fontWeight:700, color:C.purple }}>AI Music Generator</div>
+              <div style={{ fontSize:10, color:C.t3 }}>Powered by MusicGen · 100% offline after first load</div>
+            </div>
+            {mgEngineRef.current && <span style={{ marginLeft:"auto", fontSize:10, fontWeight:600, padding:"2px 8px", borderRadius:10, background:"rgba(34,197,94,0.15)", color:C.green, border:"1px solid rgba(34,197,94,0.3)" }}>Ready</span>}
+          </div>
+
+          {/* Prompt input */}
+          <div style={{ marginBottom:12 }}>
+            <div style={{ fontSize:11, color:C.t3, marginBottom:6, fontWeight:600 }}>DESCRIBE YOUR MUSIC</div>
+            <textarea
+              value={mgPrompt}
+              onChange={e => setMgPrompt(e.target.value)}
+              placeholder="e.g. upbeat electronic dance music with heavy bass and synths…"
+              rows={3}
+              style={{ width:"100%", padding:"10px 12px", background:C.bgCard, border:`1px solid ${C.border}`, borderRadius:10, color:C.t1, fontSize:13, lineHeight:1.5, fontFamily:"inherit" }}
+            />
+          </div>
+
+          {/* Style presets */}
+          <div style={{ fontSize:11, color:C.t3, marginBottom:8, fontWeight:600 }}>QUICK STYLES</div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6, marginBottom:14 }}>
+            {Object.entries(MOOD_PROMPTS).map(([id, prompt]) => {
+              const EMOJIS2 = {happy:"😊",sad:"😢",energetic:"⚡",calm:"🌿",dark:"🌑",romantic:"💗",epic:"🎬",lofi:"🎧"};
+              const LABELS  = {happy:"Happy",sad:"Sad",energetic:"Energy",calm:"Calm",dark:"Dark",romantic:"Romance",epic:"Epic",lofi:"Lo-fi"};
+              const isActive = mgPrompt === prompt;
+              return (
+                <button key={id} onClick={() => setMgPrompt(prompt)} style={{
+                  padding:"8px 4px", borderRadius:10, border:`1px solid ${isActive ? C.purple : C.border}`,
+                  background: isActive ? "rgba(168,85,247,0.15)" : C.bgCard,
+                  cursor:"pointer", WebkitTapHighlightColor:"transparent",
+                  display:"flex", flexDirection:"column", alignItems:"center", gap:3,
+                }}>
+                  <span style={{ fontSize:18 }}>{EMOJIS2[id]}</span>
+                  <span style={{ fontSize:9, color: isActive ? C.purple : C.t3, fontWeight: isActive ? 600 : 400 }}>{LABELS[id]}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Duration */}
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16, padding:"10px 12px", background:C.bgCard, borderRadius:10, border:`1px solid ${C.border}` }}>
+            <span style={{ fontSize:11, color:C.t3, fontWeight:600, flexShrink:0 }}>DURATION</span>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              {[5,10,15,30].map(d => (
+                <button key={d} onClick={() => setMgDuration(d)} style={{ padding:"5px 12px", borderRadius:20, border:`1px solid ${mgDuration===d?C.blue:C.border}`, background:mgDuration===d?`${C.blue}18`:C.bgPanel, color:mgDuration===d?C.blue:C.t3, fontSize:11, fontWeight:600, cursor:"pointer" }}>{d}s</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Progress */}
+          {(mgStatus === "loading-model" || mgStatus === "generating") && (
+            <div style={{ marginBottom:14, padding:"12px", background:C.bgCard, borderRadius:10, border:`1px solid ${C.border}` }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+                <Spinner />
+                <span style={{ fontSize:12, color:C.t2 }}>{mgProgressText}</span>
+              </div>
+              {mgStatus === "loading-model" && mgProgress > 0 && (
+                <div style={{ height:3, background:C.bgDeep, borderRadius:4 }}>
+                  <div style={{ height:"100%", width:`${mgProgress}%`, background:C.purple, borderRadius:4, transition:"width 0.3s" }} />
+                </div>
+              )}
+              {mgStatus === "generating" && (
+                <div style={{ height:3, background:C.bgDeep, borderRadius:4, overflow:"hidden" }}>
+                  <div style={{ height:"100%", width:"40%", background:C.purple, borderRadius:4, animation:"oai-slide-bar 1.5s ease-in-out infinite" }} />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Error */}
+          {mgStatus === "error" && (
+            <div style={{ marginBottom:14, padding:"12px", background:"rgba(239,68,68,0.08)", borderRadius:10, border:"1px solid rgba(239,68,68,0.2)", fontSize:12, color:C.red }}>{mgProgressText}</div>
+          )}
+
+          {/* Generated audio player */}
+          {mgAudioUrl && (mgStatus === "playing" || mgStatus === "done") && (
+            <div style={{ marginBottom:14, padding:"14px", background:`rgba(168,85,247,0.08)`, borderRadius:12, border:`1px solid rgba(168,85,247,0.2)` }}>
+              <div style={{ fontSize:12, fontWeight:600, color:C.purple, marginBottom:10 }}>✨ Music Generated!</div>
+              <audio controls src={mgAudioUrl} style={{ width:"100%", borderRadius:8, height:36 }} />
+              <a href={mgAudioUrl} download="ai-music.wav" style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:7, marginTop:10, padding:"10px", background:"rgba(34,197,94,0.10)", border:"1px solid rgba(34,197,94,0.25)", borderRadius:9, color:C.green, fontSize:12, fontWeight:600, textDecoration:"none" }}>
+                <Icon d={IC.dl} size={13} stroke={C.green} /> Download (WAV)
+              </a>
+            </div>
+          )}
+
+          {/* Generate button */}
+          <button onClick={generateMusic}
+            disabled={mgStatus==="loading-model"||mgStatus==="generating"}
+            style={{ width:"100%", padding:"15px", borderRadius:12, border:"none", cursor: mgStatus==="loading-model"||mgStatus==="generating" ? "not-allowed" : "pointer",
+              background: mgStatus==="playing" ? C.red : mgStatus==="loading-model"||mgStatus==="generating" ? C.t3 : `linear-gradient(135deg,${C.purple},${C.blue})`,
+              color:"#fff", fontSize:15, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center", gap:10, WebkitTapHighlightColor:"transparent" }}>
+            {mgStatus==="loading-model" ? <><Spinner />Loading model…</> :
+             mgStatus==="generating"    ? <><Spinner />Generating music…</> :
+             mgStatus==="playing"       ? <><Icon d={IC.stopSq} size={16} stroke="#fff" fill="#fff" />Stop</> :
+             <><span style={{ fontSize:18 }}>🎵</span>Generate Music</>}
+          </button>
+
+          <div style={{ fontSize:10, color:C.t3, textAlign:"center", marginTop:10, lineHeight:1.5 }}>
+            First use downloads MusicGen (~300MB) into browser cache.<br/>After that, works 100% offline forever.
+          </div>
+        </div>
+      )}
+
+      {/* ── Mashup track list ── */}
+      {studioTab === "mashup" && <div style={{ flex: 1, overflowY: "auto", padding: "12px", WebkitOverflowScrolling: "touch" }}>
+        {!tracks.length && (
+          <div style={{ textAlign: "center", padding: "48px 20px" }}>
+            <div style={{ fontSize: 48, marginBottom: 14 }}>🎵</div>
+            <div style={{ fontSize: 14, color: C.t2, fontWeight: 500, marginBottom: 6 }}>No tracks yet</div>
+            <div style={{ fontSize: 12, color: C.t3 }}>Tap "Add Tracks" to load MP3 or WAV files and create a mashup</div>
+          </div>
+        )}
+        {tracks.map((t, i) => (
+          <div key={t.id} style={{ background: C.bgCard, borderRadius: 14, padding: "14px", marginBottom: 10, border: `1px solid ${C.border}` }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <div style={{ width: 40, height: 40, borderRadius: 10, background: `linear-gradient(135deg,${GRAD[i%GRAD.length][0]},${GRAD[i%GRAD.length][1]})`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                <Icon d={IC.waveform} size={18} stroke="#fff" />
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.t1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</div>
+                <div style={{ fontSize: 10, color: C.t3, marginTop: 2 }}>{fmtDur(t.duration)}</div>
+              </div>
+              <button onClick={() => { if (playing) stopAll(); setTracks(p => p.filter(x => x.id !== t.id)); setExportUrl(null); }} style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 7, color: C.red, padding: "5px 7px", cursor: "pointer" }}>
+                <Icon d={IC.x} size={13} stroke={C.red} />
+              </button>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Icon d={IC.vol} size={13} stroke={C.t3} />
+              <input type="range" min={0} max={1} step={0.01} value={t.volume}
+                onChange={e => setTracks(p => p.map(x => x.id === t.id ? { ...x, volume: +e.target.value } : x))}
+                style={{ flex: 1, accentColor: GRAD[i%GRAD.length][0], height: 4, cursor: "pointer" }} />
+              <span style={{ fontSize: 10, color: C.t3, width: 32, textAlign: "right" }}>{Math.round(t.volume * 100)}%</span>
+            </div>
+          </div>
+        ))}
+      </div>}{/* end mashup track list */}
+
+      {/* Controls — mashup only */}
+      {studioTab === "mashup" && tracks.length > 0 && (
+        <div style={{ padding: "12px 14px", background: C.bgPanel, borderTop: `1px solid ${C.border}`, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+            <span style={{ fontSize: 11, color: C.t3, width: 50, flexShrink: 0 }}>Master</span>
+            <input type="range" min={0} max={1} step={0.01} value={masterVol}
+              onChange={e => setMasterVol(+e.target.value)}
+              style={{ flex: 1, accentColor: C.purple, height: 4, cursor: "pointer" }} />
+            <span style={{ fontSize: 10, color: C.t3, width: 32, textAlign: "right" }}>{Math.round(masterVol*100)}%</span>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={playMix} style={{ flex: 2, padding: "13px", borderRadius: 11, border: "none", cursor: "pointer", background: playing ? C.red : C.green, color: "#fff", fontSize: 14, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, WebkitTapHighlightColor: "transparent" }}>
+              <Icon d={playing ? IC.stop2 : IC.play} size={16} stroke="#fff" fill="#fff" />
+              {playing ? "Stop" : "Play Mix"}
+            </button>
+            <button onClick={exportMix} disabled={exporting} style={{ flex: 1, padding: "13px", borderRadius: 11, border: `1px solid ${C.border}`, background: C.bgCard, color: C.t2, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, WebkitTapHighlightColor: "transparent" }}>
+              {exporting ? <Spinner /> : <Icon d={IC.dl} size={14} stroke={C.t2} />}
+              {exporting ? "…" : "Export"}
+            </button>
+          </div>
+          {exportUrl && (
+            <a href={exportUrl} download="mashup.wav" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, marginTop: 10, padding: "11px", background: "rgba(34,197,94,0.10)", border: "1px solid rgba(34,197,94,0.25)", borderRadius: 10, color: C.green, fontSize: 12.5, fontWeight: 600, textDecoration: "none", WebkitTapHighlightColor: "transparent" }}>
+              <Icon d={IC.dl} size={13} stroke={C.green} /> Download Mashup (WAV)
+            </a>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // If CLERK_KEY is a placeholder, skip auth and go straight to the app.
 // Replace CLERK_KEY with your real Publishable Key from https://clerk.com to enable login.
 export default function OfflineAI() {

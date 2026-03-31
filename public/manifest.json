@@ -1,0 +1,24 @@
+{
+  "name": "Codeforge AI",
+  "short_name": "CodeforgeAI",
+  "description": "Your private AI assistant — runs 100% on your device",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#06111e",
+  "theme_color": "#06111e",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon-128.png",
+      "sizes": "128x128",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-256.png",
+      "sizes": "256x256",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
