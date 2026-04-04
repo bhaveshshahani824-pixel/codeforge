@@ -1660,40 +1660,59 @@ CODE TO TEST:\n\
             }
             // ── VS Code: Inline Code Suggestion ───────────────────────────────
             Some("inline_suggest") => {
-                let context  = val["context"].as_str().unwrap_or("").to_string();
-                let language = val["language"].as_str().unwrap_or("").to_string();
+                let context     = val["context"].as_str().unwrap_or("").to_string();
+                let line_prefix = val["linePrefix"].as_str().unwrap_or("").to_string();
+                let language    = val["language"].as_str().unwrap_or("").to_string();
+                let suggested_tokens = val["suggestedTokens"].as_u64().unwrap_or(80) as u32;
+
+                // Build the prompt:
+                // We show the context up to cursor, and explicitly tell the model
+                // what text is already on the current partial line so it doesn't repeat it.
+                let line_hint = if line_prefix.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\nThe current partial line already contains: `{}`\nContinue from AFTER that — do not repeat it.\n", line_prefix.trim())
+                };
 
                 let prompt = format!(
                     "<|im_start|>system\n\
-You are a code completion AI. Continue the code from exactly where <CURSOR> is.\n\
-Rules:\n\
-- Output ONLY the raw code continuation — no markdown, no ``` fences, no explanations\n\
-- Never repeat code that already exists before <CURSOR>\n\
-- Match indentation exactly — count the spaces/tabs of the surrounding lines\n\
-- Complete the current line first, then add the next 1-2 logical lines if needed\n\
-- Stop after one complete statement or block — do not over-generate\n\
-- If inside a function body, stay inside it — do not close the function unless needed\
+You are a code completion engine. Your ONLY job is to output the missing code that goes at <CURSOR>.\n\
+\n\
+Strict rules:\n\
+- Output ONLY the raw code that continues from <CURSOR> — nothing else\n\
+- NO markdown fences, NO explanations, NO comments unless the surrounding code already has them\n\
+- NEVER repeat any code that appears before <CURSOR>\n\
+- Complete the current line first (just the remainder of the line), then add at most 2 more lines if they are the natural next step\n\
+- Match the exact indentation style of the file (spaces vs tabs, same depth)\n\
+- Stop at a logical boundary — one statement, one return, one if-block — do not generate an entire function\n\
+- If there is nothing meaningful to complete, output a single newline and stop\
 <|im_end|>\n\
 <|im_start|>user\n\
 Language: {language}\n\
-\n\
+{line_hint}\n\
 {context}<CURSOR>\
 <|im_end|>\n\
 <|im_start|>assistant\n"
                 );
+
                 let tx_opt = {
                     let lock = clients.lock().await;
                     lock.get(&id).map(|c| c.tx.clone())
                 };
                 if let Some(tx) = tx_opt {
                     let port = SERVER_PORT;
+                    let n_predict = suggested_tokens.max(20).min(120); // tight cap — inline completions should be short
                     tauri::async_runtime::spawn(async move {
                         use futures_util::StreamExt;
                         let client = reqwest::Client::new();
                         let body = serde_json::json!({
-                            "prompt": prompt, "n_predict": 200,
-                            "temperature": 0.1, "stream": true,
-                            "repeat_penalty": 1.0, "stop": ["<|im_end|>", "<|im_start|>"]
+                            "prompt": prompt,
+                            "n_predict": n_predict,
+                            "temperature": 0.1,
+                            "stream": true,
+                            "repeat_penalty": 1.05,
+                            // Stop on: chat delimiters, blank line (over-gen), comment start
+                            "stop": ["<|im_end|>", "<|im_start|>", "\n\n", "//", "#", "/*"]
                         });
                         let res = match client.post(format!("http://127.0.0.1:{port}/completion")).json(&body).send().await {
                             Ok(r) => r,

@@ -36,6 +36,8 @@ let currentOpMeta:    Record<string, any> = {};
 
 // Inline suggestion — resolved when Hub returns suggestion
 let pendingInlineResolve: ((s: string) => void) | null = null;
+// Request ID guard — prevents stale responses from resolving new requests
+let inlineRequestId   = 0;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -192,19 +194,25 @@ function registerInlineSuggester(context: vscode.ExtensionContext): void {
       if (!isConnected) return null;
       if (currentOperation && currentOperation !== "inline_suggest") return null;
 
+      // Need at least 3 non-whitespace chars on the current line to trigger
       const linePrefix = doc.getText(new vscode.Range(position.with(undefined, 0), position));
       if (!linePrefix.trim() || linePrefix.trim().length < 3) return null;
 
-      // Get up to 10 lines of context above cursor
-      const startLine  = Math.max(0, position.line - 10);
+      // Give the model: up to 20 lines of prior context + the current partial line
+      const startLine   = Math.max(0, position.line - 20);
       const contextCode = doc.getText(new vscode.Range(new vscode.Position(startLine, 0), position));
 
       if (token.isCancellationRequested) return null;
 
-      const suggestion = await requestInlineSuggestion(contextCode, doc.languageId, token);
+      const suggestion = await requestInlineSuggestion(contextCode, linePrefix, doc.languageId, token);
       if (!suggestion || token.isCancellationRequested) return null;
 
-      return [new vscode.InlineCompletionItem(suggestion)];
+      // VS Code inserts the completion starting at the cursor position.
+      // The model sometimes echoes back the partial line — strip it.
+      const stripped = stripLinePrefix(suggestion, linePrefix);
+      if (!stripped.trim()) return null;
+
+      return [new vscode.InlineCompletionItem(stripped)];
     },
   };
 
@@ -213,23 +221,56 @@ function registerInlineSuggester(context: vscode.ExtensionContext): void {
   );
 }
 
+/**
+ * If the model echoed the partial line at the start of its suggestion,
+ * remove that duplicate portion so the cursor doesn't see double text.
+ * e.g. linePrefix = "const x = "  suggestion = "const x = 42;" → returns "42;"
+ */
+function stripLinePrefix(suggestion: string, linePrefix: string): string {
+  const trimmedPrefix = linePrefix.trimStart();
+  const trimmedSug    = suggestion.trimStart();
+
+  // Try progressively shorter suffix of linePrefix to find the overlap
+  for (let len = trimmedPrefix.length; len > 2; len--) {
+    const suffix = trimmedPrefix.slice(-len);
+    if (trimmedSug.startsWith(suffix)) {
+      // Return everything after the duplicated part, re-adding leading whitespace
+      const leadingSpaces = suggestion.match(/^(\s*)/)?.[1] ?? "";
+      return leadingSpaces + trimmedSug.slice(len);
+    }
+  }
+  return suggestion;
+}
+
 function requestInlineSuggestion(
-  ctx: string, language: string, token: vscode.CancellationToken
+  ctx: string, linePrefix: string, language: string, token: vscode.CancellationToken
 ): Promise<string> {
+  // Bump request ID — any older pending resolve is now stale and must be ignored
+  const myId = ++inlineRequestId;
+
   return new Promise((resolve) => {
-    const timeout = setTimeout(() => { pendingInlineResolve = null; resolve(""); }, INLINE_TIMEOUT_MS);
+    const timeout = setTimeout(() => {
+      if (inlineRequestId === myId) { pendingInlineResolve = null; }
+      resolve("");
+    }, INLINE_TIMEOUT_MS);
 
     token.onCancellationRequested(() => {
       clearTimeout(timeout);
-      pendingInlineResolve = null;
+      if (inlineRequestId === myId) { pendingInlineResolve = null; }
       resolve("");
     });
 
-    pendingInlineResolve = (suggestion: string) => { clearTimeout(timeout); resolve(suggestion); };
+    // Only the most recent request gets the resolve callback
+    pendingInlineResolve = (suggestion: string) => {
+      if (inlineRequestId !== myId) { resolve(""); return; }  // stale — discard
+      clearTimeout(timeout);
+      resolve(suggestion);
+    };
 
     currentOperation = "inline_suggest";
     responseBuffer   = "";
-    send({ type: "inline_suggest", context: ctx, language, suggestedTokens: 60 });
+    // Pass linePrefix so Rust can use it as a prefix hint and avoid re-generating it
+    send({ type: "inline_suggest", context: ctx, linePrefix, language, suggestedTokens: 80 });
   });
 }
 
