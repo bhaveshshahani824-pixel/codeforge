@@ -1782,7 +1782,7 @@ USER REQUEST: {request}"
                 let prompt = format!(
                     "<|im_start|>system\n{system_prompt}\n<|im_end|>\n\
 <|im_start|>user\n{user_msg}\n<|im_end|>\n\
-<|im_start|>assistant\n{{\"actions\":["
+<|im_start|>assistant\n"
                 );
 
                 let tx_opt = { let lock = clients.lock().await; lock.get(&id).map(|c| c.tx.clone()) };
@@ -1790,8 +1790,6 @@ USER REQUEST: {request}"
                     let port = SERVER_PORT;
                     tauri::async_runtime::spawn(async move {
                         use futures_util::StreamExt;
-                        // Pre-fill the opening of the JSON so the model continues from there
-                        let _ = tx.send(serde_json::json!({"type":"token","content":"{\"actions\":["}).to_string());
                         let client = reqwest::Client::new();
                         let body = serde_json::json!({
                             "prompt":         prompt,

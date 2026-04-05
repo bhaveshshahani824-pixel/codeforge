@@ -149,13 +149,24 @@ function finishAiMessage() {
       // Parse and execute asynchronously
       (async () => {
         try {
-          const cleaned = raw.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+          // Strip markdown fences if model wrapped output
+          let cleaned = raw.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+          // Find the first { or [ to tolerate any leading text the model may have output
+          const jsonStart = cleaned.search(/[\[{]/);
+          if (jsonStart > 0) cleaned = cleaned.slice(jsonStart);
+          // Ensure the JSON is complete — small models sometimes truncate; close it if needed
+          const openBraces   = (cleaned.match(/\{/g) || []).length;
+          const closeBraces  = (cleaned.match(/\}/g) || []).length;
+          const openBrackets = (cleaned.match(/\[/g) || []).length;
+          const closeBrackets= (cleaned.match(/\]/g) || []).length;
+          if (openBrackets > closeBrackets) cleaned += "]";
+          if (openBraces   > closeBraces)   cleaned += "}";
           const parsed  = JSON.parse(cleaned);
           const actions = Array.isArray(parsed) ? parsed : (parsed.actions || []);
-          if (!actions.length) throw new Error("No actions found in AI response");
+          if (!actions.length) throw new Error("No actions returned — try rephrasing your request");
           await executeBuildActions(actions, savedEl);
         } catch (e) {
-          savedEl.innerHTML = `<span style="color:#fca5a5">⚠️ ${e.message}</span>`;
+          savedEl.innerHTML = `<span style="color:#fca5a5">⚠️ ${e.message}<br><small style="color:#475569">Try being more specific, e.g. "highlight cells above 100 in green"</small></span>`;
         }
       })();
       return;
@@ -882,9 +893,10 @@ async function runBuildAction(context, sheet, action, sel, selAddr) {
         : (action.column && typeof action.column === "string")
           ? action.column.toUpperCase().charCodeAt(0) - 65 : 0;
       if (action.value !== undefined) {
+        // FilterOn.custom handles single-value text/number criterion correctly
         sheet.autoFilter.apply(rng, colIdx, {
           criterion1: String(action.value),
-          filterOn:   Excel.FilterOn.values,
+          filterOn:   Excel.FilterOn.custom,
         });
       } else {
         sheet.autoFilter.apply(rng, colIdx);
@@ -984,8 +996,9 @@ async function runBuildAction(context, sheet, action, sel, selAddr) {
 
     case "set_border": {
       const rng         = getRange(action.range);
-      const styleMap    = { thin: "Thin", medium: "Medium", thick: "Thick", dashed: "Dash", dotted: "Dot", none: "None" };
-      const borderStyle = styleMap[action.style] || "Thin";
+      // Office.js BorderLineStyle enum keys are lowercase ("thin","medium","thick","dash","dot")
+      const styleMap    = { thin: "thin", medium: "medium", thick: "thick", dashed: "dash", dotted: "dot", none: "none" };
+      const borderStyle = styleMap[(action.style || "thin").toLowerCase()] || "thin";
       const color       = action.color || "#000000";
       const sides = [
         Excel.BorderIndex.edgeTop, Excel.BorderIndex.edgeBottom,
@@ -995,7 +1008,7 @@ async function runBuildAction(context, sheet, action, sel, selAddr) {
       for (const side of sides) {
         try {
           const b = rng.format.borders.getItem(side);
-          b.style = Excel.BorderLineStyle[borderStyle] || Excel.BorderLineStyle.thin;
+          b.style = Excel.BorderLineStyle[borderStyle];
           b.color = color;
         } catch { /* skip unsupported sides for single-cell ranges */ }
       }
@@ -1023,11 +1036,15 @@ async function runBuildAction(context, sheet, action, sel, selAddr) {
       cf.cellValue.format.fill.color = action.bgColor || "#FFFF00";
       if (action.textColor) cf.cellValue.format.font.color = action.textColor;
       if (action.bold !== undefined) cf.cellValue.format.font.bold = action.bold;
-      cf.cellValue.rule = {
+      // formula2 must only be included for "between" — never pass undefined
+      const cfRule = {
         formula1: String(action.value),
-        formula2: action.value2 !== undefined ? String(action.value2) : undefined,
         operator: opMap[action.rule] || Excel.ConditionalCellValueOperator.greaterThan,
       };
+      if (action.value2 !== undefined && action.value2 !== null) {
+        cfRule.formula2 = String(action.value2);
+      }
+      cf.cellValue.rule = cfRule;
       return `Conditional format: ${action.rule} ${action.value}${action.value2 !== undefined ? " – " + action.value2 : ""} → ${action.bgColor || "#FFFF00"}`;
     }
 
