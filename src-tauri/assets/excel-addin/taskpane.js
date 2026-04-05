@@ -28,10 +28,12 @@ function setMode(m) {
   document.getElementById("modeAsk").classList.toggle("active",     m === "ask");
   document.getElementById("modeFormula").classList.toggle("active", m === "formula");
   document.getElementById("modeMacro").classList.toggle("active",   m === "macro");
+  document.getElementById("modeBuild").classList.toggle("active",   m === "build");
 
   if (m === "ask")     { $askBtn().textContent = "Ask";      $question().placeholder = "e.g. What is revenue for 2023?"; }
   if (m === "formula") { $askBtn().textContent = "Generate"; $question().placeholder = "e.g. VLOOKUP employee name from Sheet2 using ID in column A"; }
   if (m === "macro")   { $askBtn().textContent = "Generate Macro"; $question().placeholder = "e.g. Highlight all cells above 1000 in red"; }
+  if (m === "build")   { $askBtn().textContent = "Run"; $question().placeholder = "e.g. Create a table, bold headers, freeze row 1 and auto-fit columns"; }
 
   const icon  = document.getElementById("emptyIcon");
   const title = document.getElementById("emptyTitle");
@@ -44,11 +46,15 @@ function setMode(m) {
     icon.textContent  = "✏️";
     title.textContent = "Generate a formula";
     sub.textContent   = "Select the target cell or range. AI sees all sheets — works with VLOOKUP, XLOOKUP, cross-sheet references.";
-  } else {
+  } else if (m === "macro") {
     icon.textContent  = "🔧";
     title.textContent = "Generate a VBA Macro";
     sub.textContent   = "Describe what you want the macro to do. AI will think first, then build it.";
-    macroHistory      = []; // reset conversation when entering macro mode
+    macroHistory      = [];
+  } else {
+    icon.textContent  = "🏗️";
+    title.textContent = "Build & format your sheet";
+    sub.textContent   = "Select your data, then describe what to do — create tables, filters, charts, formatting and more.";
   }
   updateAskBtn();
 }
@@ -63,9 +69,10 @@ function updateAskBtn() {
   const hasText = $question().value.trim().length > 0;
   $askBtn().disabled = !isConnected || isStreaming || !hasText;
   if (!isConnected)           $subHint().textContent = "⚠️ Open CodeForge app first";
-  else if (isStreaming)       $subHint().textContent = mode === "macro" ? "Thinking…" : "Answering…";
+  else if (isStreaming)       $subHint().textContent = mode === "macro" ? "Thinking…" : mode === "build" ? "Planning actions…" : "Answering…";
   else if (mode === "ask")    $subHint().textContent = "Select cells in Excel, then ask a question";
   else if (mode === "formula")$subHint().textContent = "Select target cell(s), then describe the formula — can reference other sheets";
+  else if (mode === "build")  $subHint().textContent = "Select your data range, describe what to do — table, filter, format, chart…";
   else                        $subHint().textContent = macroHistory.length ? "Answer the questions above, then click Generate Macro" : "Describe your macro idea";
 }
 function hideEmpty() { const e = $empty(); if (e) e.remove(); }
@@ -118,9 +125,7 @@ function finishAiMessage() {
 
     if (mode === "macro") {
       const text = currentAiEl.textContent.trim();
-      // Store this AI turn in macro history for follow-up turns
       macroHistory.push({ role: "assistant", content: text });
-      // Detect VBA code — if Sub...End Sub present, show Copy & Install button
       const vbaMatch = text.match(/(?:Sub|Function)\s+\w[\s\S]*?End\s+(?:Sub|Function)/i);
       if (vbaMatch) {
         pendingMacro = vbaMatch[0].trim();
@@ -129,8 +134,31 @@ function finishAiMessage() {
         btn.textContent = "📋 Copy & Install Macro";
         btn.onclick     = copyAndInstallMacro;
         currentAiEl.appendChild(btn);
-        macroHistory = []; // reset history after successful generation
+        macroHistory = [];
       }
+    }
+
+    if (mode === "build") {
+      const raw  = currentAiEl.textContent.trim();
+      // Replace streaming text with a "running" indicator while we execute
+      currentAiEl.innerHTML = '<div class="build-thinking"><div class="build-spinner"></div><span>Applying actions…</span></div>';
+      const savedEl = currentAiEl;
+      currentAiEl   = null;
+      isStreaming    = false;
+      updateAskBtn();
+      // Parse and execute asynchronously
+      (async () => {
+        try {
+          const cleaned = raw.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+          const parsed  = JSON.parse(cleaned);
+          const actions = Array.isArray(parsed) ? parsed : (parsed.actions || []);
+          if (!actions.length) throw new Error("No actions found in AI response");
+          await executeBuildActions(actions, savedEl);
+        } catch (e) {
+          savedEl.innerHTML = `<span style="color:#fca5a5">⚠️ ${e.message}</span>`;
+        }
+      })();
+      return;
     }
 
     currentAiEl = null;
@@ -696,7 +724,385 @@ function showMacroInstructions() {
   document.body.appendChild(overlay);
 }
 
-async function ask() { mode === "formula" ? askFormula() : mode === "macro" ? askMacro() : askQuestion(); }
+async function ask() {
+  if (mode === "formula") askFormula();
+  else if (mode === "macro") askMacro();
+  else if (mode === "build") askBuild();
+  else askQuestion();
+}
+
+// ── Build mode ────────────────────────────────────────────────────────────────
+
+async function askBuild() {
+  const request = $question().value.trim();
+  if (!request || !isConnected || isStreaming) return;
+
+  try {
+    await Excel.run(async (context) => {
+      const range = context.workbook.getSelectedRange();
+      const sheet = context.workbook.worksheets.getActiveWorksheet();
+      range.load(["address", "rowIndex", "columnIndex", "rowCount", "columnCount"]);
+      sheet.load("name");
+      await context.sync();
+
+      const selAddress = range.address.split("!").pop();
+
+      // Gather all sheets schema for context
+      const { schema: sheetsSchema, workbookName } = await gatherSheetsSchema(context);
+
+      // Build context string
+      let contextStr  = `Active sheet: "${sheet.name}" | Workbook: "${workbookName}"\n`;
+      contextStr     += `Selected range: ${selAddress} (${range.rowCount} rows × ${range.columnCount} cols)\n\n`;
+      for (const s of sheetsSchema) {
+        const mark = s.isActive ? " ← ACTIVE" : "";
+        contextStr += `Sheet "${s.name}"${mark}: ${s.rowCount} rows`;
+        if (s.headers.length) {
+          contextStr += `  Columns: ${s.headers.map(h => `${h.col}:"${h.header}"`).join(", ")}`;
+        }
+        contextStr += "\n";
+      }
+
+      addMessage(`🏗️ ${selAddress} · ${range.rowCount}R × ${range.columnCount}C`, "status-msg");
+      addMessage(request, "user");
+      $question().value      = "";
+      $question().style.height = "";
+      updateAskBtn();
+      isStreaming = true;
+      updateAskBtn();
+      startAiMessage();
+
+      ws.send(JSON.stringify({
+        type:            "excel_build",
+        request,
+        selAddress,
+        sheetName:       sheet.name,
+        workbookName,
+        context:         contextStr,
+        sheetsSchema,
+        rowCount:        range.rowCount,
+        columnCount:     range.columnCount,
+        suggestedTokens: 400,
+      }));
+    });
+  } catch (err) {
+    isStreaming = false;
+    updateAskBtn();
+    addMessage("⚠️ " + err.message, "error");
+  }
+}
+
+// Execute the action array returned by the AI
+async function executeBuildActions(actions, displayEl) {
+  const log = [];
+
+  try {
+    await Excel.run(async (context) => {
+      const sheet = context.workbook.worksheets.getActiveWorksheet();
+      const sel   = context.workbook.getSelectedRange();
+      sel.load(["address", "rowIndex", "columnIndex", "rowCount", "columnCount"]);
+      await context.sync();
+      const selAddr = sel.address.split("!").pop();
+
+      for (const action of actions) {
+        try {
+          const msg = await runBuildAction(context, sheet, action, sel, selAddr);
+          await context.sync();
+          log.push({ ok: true, op: action.op, msg });
+        } catch (e) {
+          log.push({ ok: false, op: action.op, msg: `${action.op}: ${e.message}` });
+        }
+      }
+    });
+  } catch (e) {
+    log.push({ ok: false, op: "excel", msg: "Excel error: " + e.message });
+  }
+
+  // Render results inside the AI message bubble
+  const chips = actions.map(a => `<span class="build-chip">${opLabel(a.op)}</span>`).join("");
+  const items = log.map(r =>
+    `<li class="${r.ok ? "ok" : "err"}">
+       <span class="act-icon">${r.ok ? "✅" : "⚠️"}</span>
+       <span>${r.msg}</span>
+     </li>`
+  ).join("");
+
+  displayEl.innerHTML =
+    `<div style="margin-bottom:6px;line-height:1.8">${chips}</div>` +
+    `<ul class="action-log">${items}</ul>`;
+
+  $chat().scrollTop = $chat().scrollHeight;
+}
+
+function opLabel(op) {
+  const labels = {
+    create_table: "Table", apply_filter: "Filter", clear_filters: "Clear Filters",
+    sort: "Sort", format_header: "Header Style", format_range: "Format",
+    conditional_format: "Cond. Format", freeze_panes: "Freeze", unfreeze_panes: "Unfreeze",
+    auto_fit_columns: "Auto-fit Cols", auto_fit_rows: "Auto-fit Rows",
+    number_format: "Number Fmt", add_total_row: "Totals Row",
+    insert_chart: "Chart", set_column_width: "Col Width", set_row_height: "Row Height",
+    set_border: "Borders", clear_formatting: "Clear Fmt", clear_conditional_formats: "Clear CF",
+    merge_cells: "Merge", unmerge_cells: "Unmerge",
+    add_sheet: "Add Sheet", rename_sheet: "Rename Sheet",
+  };
+  return labels[op] || op;
+}
+
+// ── Individual action runners ─────────────────────────────────────────────────
+
+async function runBuildAction(context, sheet, action, sel, selAddr) {
+  // Helper: resolve range — "auto" or undefined → use current selection
+  const getRange = (a) =>
+    (a && a !== "auto") ? sheet.getRange(a) : sheet.getRange(selAddr);
+
+  switch (action.op) {
+
+    // ── Tables ────────────────────────────────────────────────────────────────
+    case "create_table": {
+      const rng = getRange(action.range);
+      const tbl = sheet.tables.add(rng, action.hasHeaders !== false);
+      tbl.style = action.style || "TableStyleMedium9";
+      if (action.name) tbl.name = action.name;
+      return `Created table (${action.style || "TableStyleMedium9"})`;
+    }
+
+    case "add_total_row": {
+      const tables = sheet.tables;
+      tables.load("items/name");
+      await context.sync();
+      if (!tables.items.length) throw new Error("No table found on sheet");
+      tables.items[0].showTotals = action.enabled !== false;
+      return `${action.enabled !== false ? "Added" : "Removed"} totals row`;
+    }
+
+    // ── Filters ───────────────────────────────────────────────────────────────
+    case "apply_filter": {
+      const rng    = getRange(action.range);
+      const colIdx = action.columnIndex !== undefined ? action.columnIndex
+        : (action.column && typeof action.column === "string")
+          ? action.column.toUpperCase().charCodeAt(0) - 65 : 0;
+      if (action.value !== undefined) {
+        sheet.autoFilter.apply(rng, colIdx, {
+          criterion1: String(action.value),
+          filterOn:   Excel.FilterOn.values,
+        });
+      } else {
+        sheet.autoFilter.apply(rng, colIdx);
+      }
+      return `Applied filter on column ${action.column || colIdx}${action.value ? ` = "${action.value}"` : ""}`;
+    }
+
+    case "clear_filters": {
+      const tables = sheet.tables;
+      tables.load("items/name");
+      await context.sync();
+      if (tables.items.length) {
+        tables.items[0].clearFilters();
+      } else {
+        sheet.autoFilter.remove();
+      }
+      return "Cleared all filters";
+    }
+
+    // ── Sort ──────────────────────────────────────────────────────────────────
+    case "sort": {
+      const rng    = getRange(action.range);
+      // Column may be absolute ("C") or relative index (0-based within range)
+      let relIdx = 0;
+      if (action.columnIndex !== undefined) {
+        relIdx = Math.max(0, action.columnIndex - sel.columnIndex);
+      } else if (action.column && typeof action.column === "string") {
+        const absIdx = action.column.toUpperCase().charCodeAt(0) - 65;
+        relIdx       = Math.max(0, absIdx - sel.columnIndex);
+      }
+      rng.sort.apply([{ key: relIdx, ascending: action.ascending !== false }]);
+      return `Sorted by column ${action.column || relIdx} ${action.ascending !== false ? "↑ A→Z" : "↓ Z→A"}`;
+    }
+
+    // ── Formatting ────────────────────────────────────────────────────────────
+    case "format_header": {
+      sel.load(["rowIndex", "columnIndex", "columnCount"]);
+      await context.sync();
+      const hdr = sheet.getRangeByIndexes(sel.rowIndex, sel.columnIndex, 1, sel.columnCount);
+      if (action.bold      !== undefined) hdr.format.font.bold   = action.bold;
+      if (action.bgColor)                 hdr.format.fill.color  = action.bgColor;
+      if (action.textColor)               hdr.format.font.color  = action.textColor;
+      if (action.fontSize)                hdr.format.font.size   = action.fontSize;
+      if (action.italic    !== undefined) hdr.format.font.italic = action.italic;
+      return `Styled header row${action.bgColor ? ` (${action.bgColor})` : ""}`;
+    }
+
+    case "format_range": {
+      const rng = getRange(action.range);
+      if (action.bold      !== undefined) rng.format.font.bold         = action.bold;
+      if (action.bgColor)                 rng.format.fill.color        = action.bgColor;
+      if (action.textColor)               rng.format.font.color        = action.textColor;
+      if (action.fontSize)                rng.format.font.size         = action.fontSize;
+      if (action.wrapText  !== undefined) rng.format.wrapText          = action.wrapText;
+      if (action.hAlign)                  rng.format.horizontalAlignment = action.hAlign;
+      if (action.vAlign)                  rng.format.verticalAlignment   = action.vAlign;
+      if (action.numberFormat) {
+        rng.load(["rowCount", "columnCount"]);
+        await context.sync();
+        rng.numberFormat = Array.from({ length: rng.rowCount }, () =>
+          Array(rng.columnCount).fill(action.numberFormat)
+        );
+      }
+      return `Formatted range${action.bgColor ? ` (fill ${action.bgColor})` : ""}`;
+    }
+
+    case "number_format": {
+      const rng = getRange(action.range);
+      rng.load(["rowCount", "columnCount"]);
+      await context.sync();
+      const fmt2d = Array.from({ length: rng.rowCount }, () =>
+        Array(rng.columnCount).fill(action.format || "#,##0.00")
+      );
+      rng.numberFormat = fmt2d;
+      return `Applied number format: ${action.format}`;
+    }
+
+    case "auto_fit_columns": {
+      getRange(action.range).format.autofitColumns();
+      return "Auto-fitted column widths";
+    }
+
+    case "auto_fit_rows": {
+      getRange(action.range).format.autofitRows();
+      return "Auto-fitted row heights";
+    }
+
+    case "set_column_width": {
+      getRange(action.range).format.columnWidth = action.width || 100;
+      return `Set column width to ${action.width}px`;
+    }
+
+    case "set_row_height": {
+      getRange(action.range).format.rowHeight = action.height || 20;
+      return `Set row height to ${action.height}px`;
+    }
+
+    case "set_border": {
+      const rng         = getRange(action.range);
+      const styleMap    = { thin: "Thin", medium: "Medium", thick: "Thick", dashed: "Dash", dotted: "Dot", none: "None" };
+      const borderStyle = styleMap[action.style] || "Thin";
+      const color       = action.color || "#000000";
+      const sides = [
+        Excel.BorderIndex.edgeTop, Excel.BorderIndex.edgeBottom,
+        Excel.BorderIndex.edgeLeft, Excel.BorderIndex.edgeRight,
+        Excel.BorderIndex.insideHorizontal, Excel.BorderIndex.insideVertical,
+      ];
+      for (const side of sides) {
+        try {
+          const b = rng.format.borders.getItem(side);
+          b.style = Excel.BorderLineStyle[borderStyle] || Excel.BorderLineStyle.thin;
+          b.color = color;
+        } catch { /* skip unsupported sides for single-cell ranges */ }
+      }
+      return `Applied ${action.style || "thin"} borders`;
+    }
+
+    case "clear_formatting": {
+      getRange(action.range).clear(Excel.ClearApplyTo.formats);
+      return "Cleared all formatting";
+    }
+
+    // ── Conditional formatting ────────────────────────────────────────────────
+    case "conditional_format": {
+      const rng   = getRange(action.range);
+      const opMap = {
+        greater_than:       Excel.ConditionalCellValueOperator.greaterThan,
+        less_than:          Excel.ConditionalCellValueOperator.lessThan,
+        equal:              Excel.ConditionalCellValueOperator.equalTo,
+        not_equal:          Excel.ConditionalCellValueOperator.notEqualTo,
+        between:            Excel.ConditionalCellValueOperator.between,
+        greater_or_equal:   Excel.ConditionalCellValueOperator.greaterThanOrEqualTo,
+        less_or_equal:      Excel.ConditionalCellValueOperator.lessThanOrEqualTo,
+      };
+      const cf  = rng.conditionalFormats.add(Excel.ConditionalFormatType.cellValue);
+      cf.cellValue.format.fill.color = action.bgColor || "#FFFF00";
+      if (action.textColor) cf.cellValue.format.font.color = action.textColor;
+      if (action.bold !== undefined) cf.cellValue.format.font.bold = action.bold;
+      cf.cellValue.rule = {
+        formula1: String(action.value),
+        formula2: action.value2 !== undefined ? String(action.value2) : undefined,
+        operator: opMap[action.rule] || Excel.ConditionalCellValueOperator.greaterThan,
+      };
+      return `Conditional format: ${action.rule} ${action.value}${action.value2 !== undefined ? " – " + action.value2 : ""} → ${action.bgColor || "#FFFF00"}`;
+    }
+
+    case "clear_conditional_formats": {
+      getRange(action.range).conditionalFormats.clearAll();
+      return "Cleared all conditional formats";
+    }
+
+    // ── Freeze panes ──────────────────────────────────────────────────────────
+    case "freeze_panes": {
+      if (action.rows && action.cols) {
+        sheet.freezePanes.freezeAt(sheet.getRangeByIndexes(action.rows, action.cols, 1, 1));
+        return `Froze ${action.rows} row(s) and ${action.cols} column(s)`;
+      } else if (action.cols) {
+        sheet.freezePanes.freezeColumns(action.cols);
+        return `Froze ${action.cols} column(s)`;
+      } else {
+        sheet.freezePanes.freezeRows(action.rows || 1);
+        return `Froze ${action.rows || 1} row(s)`;
+      }
+    }
+
+    case "unfreeze_panes": {
+      sheet.freezePanes.unfreeze();
+      return "Unfroze all panes";
+    }
+
+    // ── Charts ────────────────────────────────────────────────────────────────
+    case "insert_chart": {
+      const dataRange = getRange(action.range);
+      const typeMap   = {
+        column:   Excel.ChartType.columnClustered,
+        bar:      Excel.ChartType.barClustered,
+        line:     Excel.ChartType.line,
+        pie:      Excel.ChartType.pie,
+        area:     Excel.ChartType.area,
+        scatter:  Excel.ChartType.xyscatter,
+        doughnut: Excel.ChartType.doughnut,
+      };
+      const chartType = typeMap[(action.type || "column").toLowerCase()] || Excel.ChartType.columnClustered;
+      const chart     = sheet.charts.add(chartType, dataRange, Excel.ChartSeriesBy.auto);
+      if (action.title) chart.title.text = action.title;
+      chart.width  = action.width  || 480;
+      chart.height = action.height || 300;
+      return `Inserted ${action.type || "column"} chart${action.title ? `: "${action.title}"` : ""}`;
+    }
+
+    // ── Cells ─────────────────────────────────────────────────────────────────
+    case "merge_cells": {
+      getRange(action.range).merge(action.across || false);
+      return "Merged cells";
+    }
+
+    case "unmerge_cells": {
+      getRange(action.range).unmerge();
+      return "Unmerged cells";
+    }
+
+    // ── Sheets ────────────────────────────────────────────────────────────────
+    case "add_sheet": {
+      const newSheet = context.workbook.worksheets.add(action.name);
+      if (action.activate) newSheet.activate();
+      return `Added sheet "${action.name || "Sheet"}"`;
+    }
+
+    case "rename_sheet": {
+      if (!action.name) throw new Error("name is required");
+      sheet.name = action.name;
+      return `Renamed sheet to "${action.name}"`;
+    }
+
+    default:
+      throw new Error(`Unknown op: "${action.op}"`);
+  }
+}
 
 function handleKey(e) { if (e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask();} }
 function autoResize(el) {

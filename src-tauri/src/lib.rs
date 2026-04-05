@@ -1728,6 +1728,116 @@ ACTIVE SHEET CELL CONTEXT:\n\
                     });
                 }
             }
+            // ── Excel: Build mode — execute Office.js actions from JSON ──────
+            Some("excel_build") => {
+                let request      = val["request"].as_str().unwrap_or("").to_string();
+                let sel_address  = val["selAddress"].as_str().unwrap_or("A1").to_string();
+                let sheet_name   = val["sheetName"].as_str().unwrap_or("Sheet1").to_string();
+                let context_str  = val["context"].as_str().unwrap_or("").to_string();
+                let row_count    = val["rowCount"].as_u64().unwrap_or(1);
+                let col_count    = val["columnCount"].as_u64().unwrap_or(1);
+
+                let system_prompt = "You are an Excel automation expert integrated into CodeForge AI.\n\
+Your job is to convert a natural language request into a JSON action list for Office.js.\n\
+\n\
+Output ONLY a valid JSON object: {\"actions\":[...]}   — no markdown fences, no explanation, nothing else.\n\
+\n\
+Available operations (use only these):\n\
+- create_table:            { range?:\"auto\", hasHeaders?:bool, style?:\"TableStyleMedium9\"|\"TableStyleLight1\"|\"TableStyleDark11\", name?:string }\n\
+- add_total_row:           { enabled?:true }\n\
+- apply_filter:            { range?:\"auto\", columnIndex?:0, column?:\"A\", value?:string }\n\
+- clear_filters:           {}\n\
+- sort:                    { range?:\"auto\", column?:\"A\", columnIndex?:0, ascending?:bool }\n\
+- format_header:           { bold?:bool, bgColor?:\"#hex\", textColor?:\"#hex\", fontSize?:number, italic?:bool }\n\
+- format_range:            { range?:\"auto\", bold?:bool, bgColor?:\"#hex\", textColor?:\"#hex\", fontSize?:number, numberFormat?:string, wrapText?:bool, hAlign?:\"Left\"|\"Center\"|\"Right\" }\n\
+- number_format:           { range?:\"auto\", format:string }  (e.g. \"#,##0.00\", \"$#,##0\", \"0%\", \"dd/mm/yyyy\")\n\
+- conditional_format:      { range?:\"auto\", rule:\"greater_than\"|\"less_than\"|\"equal\"|\"between\"|\"not_equal\"|\"greater_or_equal\"|\"less_or_equal\", value:number, value2?:number, bgColor?:\"#hex\", textColor?:\"#hex\", bold?:bool }\n\
+- clear_conditional_formats:{ range?:\"auto\" }\n\
+- auto_fit_columns:        { range?:\"auto\" }\n\
+- auto_fit_rows:           { range?:\"auto\" }\n\
+- set_column_width:        { range?:\"auto\", width:number }\n\
+- set_row_height:          { range?:\"auto\", height:number }\n\
+- set_border:              { range?:\"auto\", style?:\"thin\"|\"medium\"|\"thick\"|\"dashed\"|\"dotted\"|\"none\", color?:\"#hex\" }\n\
+- clear_formatting:        { range?:\"auto\" }\n\
+- freeze_panes:            { rows?:1, cols?:0 }\n\
+- unfreeze_panes:          {}\n\
+- insert_chart:            { type:\"column\"|\"bar\"|\"line\"|\"pie\"|\"area\"|\"scatter\"|\"doughnut\", range?:\"auto\", title?:string, width?:480, height?:300 }\n\
+- merge_cells:             { range?:\"auto\", across?:bool }\n\
+- unmerge_cells:           { range?:\"auto\" }\n\
+- add_sheet:               { name?:string, activate?:bool }\n\
+- rename_sheet:            { name:string }\n\
+\n\
+Rules:\n\
+- Use range:\"auto\" to mean the user's currently selected range\n\
+- Combine multiple steps naturally, e.g. create_table + format_header + auto_fit_columns + freeze_panes\n\
+- Output ONLY the JSON. Absolutely no other text.";
+
+                let user_msg = format!(
+                    "WORKBOOK CONTEXT:\n{context_str}\n\
+Selected range: {sel_address} ({row_count} rows × {col_count} cols) on sheet \"{sheet_name}\"\n\
+\n\
+USER REQUEST: {request}"
+                );
+
+                let prompt = format!(
+                    "<|im_start|>system\n{system_prompt}\n<|im_end|>\n\
+<|im_start|>user\n{user_msg}\n<|im_end|>\n\
+<|im_start|>assistant\n{{\"actions\":["
+                );
+
+                let tx_opt = { let lock = clients.lock().await; lock.get(&id).map(|c| c.tx.clone()) };
+                if let Some(tx) = tx_opt {
+                    let port = SERVER_PORT;
+                    tauri::async_runtime::spawn(async move {
+                        use futures_util::StreamExt;
+                        // Pre-fill the opening of the JSON so the model continues from there
+                        let _ = tx.send(serde_json::json!({"type":"token","content":"{\"actions\":["}).to_string());
+                        let client = reqwest::Client::new();
+                        let body = serde_json::json!({
+                            "prompt":         prompt,
+                            "n_predict":      500,
+                            "temperature":    0.1,
+                            "stream":         true,
+                            "repeat_penalty": 1.05,
+                            "stop":           ["<|im_end|>", "\n\n\n"],
+                        });
+                        let res = match client
+                            .post(format!("http://127.0.0.1:{port}/completion"))
+                            .json(&body).send().await {
+                            Ok(r) => r,
+                            Err(e) => { let _ = tx.send(serde_json::json!({"type":"error","message":e.to_string()}).to_string()); return; }
+                        };
+                        let mut stream = res.bytes_stream();
+                        let mut buf    = String::new();
+                        'stream: loop {
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                                    while let Some(pos) = buf.find('\n') {
+                                        let line = buf[..pos].trim().to_string();
+                                        buf = buf[pos+1..].to_string();
+                                        if line.starts_with("data: ") {
+                                            if let Ok(j) = serde_json::from_str::<serde_json::Value>(&line["data: ".len()..]) {
+                                                if let Some(tok) = j["content"].as_str() {
+                                                    if !tok.is_empty() {
+                                                        let _ = tx.send(serde_json::json!({"type":"token","content":tok}).to_string());
+                                                    }
+                                                }
+                                                if j["stop"].as_bool().unwrap_or(false) {
+                                                    let _ = tx.send(serde_json::json!({"type":"done"}).to_string());
+                                                    break 'stream;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(Err(_)) | None => { break; }
+                            }
+                        }
+                        let _ = tx.send(serde_json::json!({"type":"done"}).to_string());
+                    });
+                }
+            }
             // ── VS Code: Generate Unit Tests ──────────────────────────────────
             Some("test_generate") => {
                 let code      = val["code"].as_str().unwrap_or("").to_string();
