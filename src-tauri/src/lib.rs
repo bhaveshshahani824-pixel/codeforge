@@ -1355,6 +1355,108 @@ QUESTION: {question}\
                     });
                 }
             }
+            // ── Browser: Translate page content to target language ────────────
+            Some("translate_page") => {
+                let content          = val["content"].as_str().unwrap_or("").to_string();
+                let target_lang      = val["targetLang"].as_str().unwrap_or("English").to_string();
+                let source_hint      = val["sourceHint"].as_str().unwrap_or("Auto-detect").to_string();
+                let page_title       = val["pageTitle"].as_str().unwrap_or("").to_string();
+                let suggested_tokens = val["suggestedTokens"].as_u64().unwrap_or(2000) as u32;
+
+                let title_line = if page_title.is_empty() {
+                    String::new()
+                } else {
+                    format!("Article title: {page_title}\n\n")
+                };
+
+                let source_line = if source_hint == "Auto-detect" {
+                    "Detect the source language automatically.".to_string()
+                } else {
+                    format!("Source language: {source_hint}")
+                };
+
+                let prompt = format!(
+                    "<|im_start|>system\n\
+You are a professional translator. Translate the provided article text to {target_lang}.\n\
+{source_line}\n\
+\n\
+Translation rules:\n\
+- Output ONLY the translated text — no headers like \"Translation:\", no explanations, no notes\n\
+- Preserve paragraph structure: keep blank lines between paragraphs exactly as in the original\n\
+- Preserve any bullet points, numbered lists, or headings format\n\
+- Keep proper nouns, brand names, and URLs exactly as they appear — do not translate them\n\
+- Keep technical terms in their standard {target_lang} equivalent if one exists\n\
+- Match the tone: formal text stays formal, casual text stays casual\n\
+- If the text ends with [content truncated...], include that marker as-is at the very end\n\
+- Do NOT add a title or summary at the top — start translating immediately from the first word\
+<|im_end|>\n\
+<|im_start|>user\n\
+{title_line}Translate the following to {target_lang}:\n\
+\n\
+{content}\
+<|im_end|>\n\
+<|im_start|>assistant\n"
+                );
+
+                let tx_opt = {
+                    let lock = clients.lock().await;
+                    lock.get(&id).map(|c| c.tx.clone())
+                };
+                if let Some(tx) = tx_opt {
+                    let port = SERVER_PORT;
+                    // Translation tokens ≈ input tokens (1:1 ratio), allow generous budget
+                    let n_predict = suggested_tokens.max(500).min(3000);
+                    tauri::async_runtime::spawn(async move {
+                        use futures_util::StreamExt;
+                        let client = reqwest::Client::new();
+                        let body = serde_json::json!({
+                            "prompt":         prompt,
+                            "n_predict":      n_predict,
+                            "temperature":    0.3,   // low temp for faithful translation
+                            "stream":         true,
+                            "repeat_penalty": 1.05,  // slightly above 1.0 — prevent repeated sentences
+                            "stop":           ["<|im_end|>", "<|im_start|>"]
+                        });
+                        let res = match client
+                            .post(format!("http://127.0.0.1:{port}/completion"))
+                            .json(&body).send().await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = tx.send(serde_json::json!({"type":"error","message":e.to_string()}).to_string());
+                                return;
+                            }
+                        };
+                        let mut stream = res.bytes_stream();
+                        let mut buf = String::new();
+                        'stream: loop {
+                            match stream.next().await {
+                                Some(Ok(chunk)) => {
+                                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                                    while let Some(pos) = buf.find('\n') {
+                                        let line = buf[..pos].trim().to_string();
+                                        buf = buf[pos+1..].to_string();
+                                        if line.starts_with("data: ") {
+                                            if let Ok(j) = serde_json::from_str::<serde_json::Value>(&line["data: ".len()..]) {
+                                                if let Some(tok) = j["content"].as_str() {
+                                                    if !tok.is_empty() {
+                                                        let _ = tx.send(serde_json::json!({"type":"token","content":tok}).to_string());
+                                                    }
+                                                }
+                                                if j["stop"].as_bool().unwrap_or(false) {
+                                                    let _ = tx.send(serde_json::json!({"type":"done"}).to_string());
+                                                    break 'stream;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(Err(_)) | None => { break; }
+                            }
+                        }
+                        let _ = tx.send(serde_json::json!({"type":"done"}).to_string());
+                    });
+                }
+            }
             Some("browser_query") => {
                 // Browser extension sends page content + user question
                 let question        = val["question"].as_str().unwrap_or("").to_string();
