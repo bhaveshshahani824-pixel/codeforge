@@ -507,7 +507,7 @@ async function applyChanges(
 
 // ── Context menu helper (explain / refactor / fix / comment) ──────────────────
 
-function sendCommand(verb: string): void {
+function sendCommand(verb: string, instruction = ""): void {
   const editor = vscode.window.activeTextEditor;
   if (!editor)      { vscode.window.showWarningMessage("CodeForge AI: No active editor.");       return; }
   if (!isConnected) { vscode.window.showWarningMessage("CodeForge AI: Not connected to Hub.");   return; }
@@ -517,18 +517,35 @@ function sendCommand(verb: string): void {
   const language  = editor.document.languageId;
   const verbLower = verb.toLowerCase();
 
-  // Token budgets tuned per command type
   const suggestedTokens =
-    verbLower.includes("explain") ? 600  :   // explanation prose
-    verbLower.includes("comment") ? 900  :   // full code + added comments
-    900;                                      // refactor, fix
+    verbLower.includes("explain") ? 600 :
+    verbLower.includes("comment") ? 900 : 900;
 
   currentOperation = "hub_chat";
-  currentOpMeta    = { verb, selected, language, canApply: !verbLower.includes("explain") };
+  currentOpMeta    = { verb, instruction, selected, language, canApply: !verbLower.includes("explain") };
   responseBuffer   = "";
 
-  send({ type: "hub_chat", verb, code: selected, language, suggestedTokens });
-  vscode.window.showInformationMessage(`CodeForge AI: Running "${verb}"…`);
+  send({ type: "hub_chat", verb, instruction, code: selected, language, suggestedTokens });
+  const label = instruction || verb;
+  vscode.window.showInformationMessage(`CodeForge AI: Running "${label}"…`);
+}
+
+/** Prompts the user for a specific refactor instruction, then sends the command. */
+async function askAndRefactor(): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor)      { vscode.window.showWarningMessage("CodeForge AI: No active editor.");       return; }
+  if (!isConnected) { vscode.window.showWarningMessage("CodeForge AI: Not connected to Hub.");   return; }
+  const selected = editor.document.getText(editor.selection);
+  if (!selected)    { vscode.window.showWarningMessage("CodeForge AI: Select some code first."); return; }
+
+  const instruction = await vscode.window.showInputBox({
+    prompt:         "Describe exactly what to refactor",
+    placeHolder:    "e.g. Remove duplicate CSS properties and change 0px to 0",
+    ignoreFocusOut: true,
+  });
+  if (instruction === undefined) return; // user pressed Escape
+
+  sendCommand("refactor", instruction.trim());
 }
 
 // ── hub_chat result handler ────────────────────────────────────────────────────
@@ -1114,7 +1131,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     // Existing commands
     vscode.commands.registerCommand("codeforgeai.explain",  () => sendCommand("Explain this code")),
-    vscode.commands.registerCommand("codeforgeai.refactor", () => sendCommand("Refactor this code to be cleaner and more efficient")),
+    vscode.commands.registerCommand("codeforgeai.refactor", () => askAndRefactor()),
     vscode.commands.registerCommand("codeforgeai.fix",      () => sendCommand("Find and fix the bug in this code")),
     vscode.commands.registerCommand("codeforgeai.comment",  () => sendCommand("Add clear inline comments to this code")),
     vscode.commands.registerCommand("codeforgeai.connect",  () => { vscode.window.showInformationMessage("CodeForge AI: Reconnecting…"); connect(); }),

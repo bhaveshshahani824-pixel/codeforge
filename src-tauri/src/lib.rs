@@ -2832,6 +2832,7 @@ Sub "
             // ── VS Code: hub_chat — explain / refactor / fix / comment ───────
             Some("hub_chat") => {
                 let verb             = val["verb"].as_str().unwrap_or("Explain").to_string();
+                let instruction      = val["instruction"].as_str().unwrap_or("").to_string();
                 let code             = val["code"].as_str().unwrap_or("").to_string();
                 let language         = val["language"].as_str().unwrap_or("code").to_string();
                 let suggested_tokens = val["suggestedTokens"].as_u64().unwrap_or(800) as u32;
@@ -2839,7 +2840,15 @@ Sub "
                 // ── Per-verb prompt, token budget, and temperature ────────────
                 // Temperature 0.1 for all code tasks — deterministic, no hallucination.
                 // Token budgets are tight to prevent rambling / over-generation.
-                let (system_instructions, user_instruction, n_predict, temperature) =
+                // Build per-verb system prompt, user message, token limit, temperature.
+                // All return (String, String, u32, f32) for consistent tuple type.
+                let task_line = if !instruction.is_empty() {
+                    format!("Task: {instruction}")
+                } else {
+                    "Task: Clean up formatting and remove only byte-for-byte duplicate lines".to_string()
+                };
+
+                let (system_instructions, user_instruction, n_predict, temperature): (String, String, u32, f32) =
                 if verb.to_lowercase().contains("explain") {
                     (
                         "You are a code explainer. Explain what the selected code does.\n\
@@ -2848,24 +2857,25 @@ Rules:\n\
 - Then list key points using plain dashes (-)\n\
 - Maximum 120 words total — be concise\n\
 - Plain text only. No markdown asterisks (*), pound signs (#), backticks, or bold markers\n\
-- Do NOT rewrite or modify the code — only explain it",
+- Do NOT rewrite or modify the code — only explain it".to_string(),
                         format!("Explain this {language} code:\n{code}"),
-                        280u32,   // ~120 words
+                        280u32,
                         0.1f32,
                     )
                 } else if verb.to_lowercase().contains("refactor") {
                     (
-                        "You are a code refactoring expert. Your ONLY job is to make the code cleaner.\n\
+                        format!("You are a code refactoring expert. Apply ONLY the task described below.\n\
+{task_line}\n\
+\n\
 STRICT Rules:\n\
-- Output ONLY the refactored code — nothing else before or after\n\
-- KEEP EVERY LINE OF LOGIC — do not remove any functionality, variables, returns, or branches\n\
-- Only rename variables for clarity, simplify obvious duplication, or clean formatting\n\
-- If unsure whether a line is needed — KEEP IT\n\
-- No markdown fences (no ``` blocks), no asterisks, no explanation text\n\
-- Same language, same framework, same indentation style as input\n\
-- Output must be the same length or longer than the input — never shorter",
-                        format!("Refactor this {language} code:\n{code}"),
-                        // give enough tokens to reproduce the full code + small changes
+- Output ONLY the modified code — no explanation, no preamble, no closing remarks\n\
+- Apply ONLY what the Task says — do not make any other changes\n\
+- KEEP every line that is not directly mentioned in the Task\n\
+- Vendor-prefixed properties (-webkit-, -moz-, -ms-) are NOT duplicates of standard properties — keep them unless the Task explicitly says to remove them\n\
+- Never remove variables, functions, imports, or logic that the Task does not mention\n\
+- No markdown fences, no backtick blocks, no asterisks\n\
+- Same language, same framework, same indentation as the input"),
+                        format!("Apply the task to this {language} code:\n{code}"),
                         (code.len() / 3 + 200).min(1200) as u32,
                         0.1f32,
                     )
@@ -2877,7 +2887,7 @@ Rules:\n\
 - Then output the COMPLETE fixed code — every original line must be present\n\
 - Make ONLY the minimal change to fix the bug — do not restructure unrelated code\n\
 - If no bug found, say 'No bug found.' and output the original code unchanged\n\
-- No markdown fences, no ``` blocks, no asterisks, no extra explanation",
+- No markdown fences, no ``` blocks, no asterisks, no extra explanation".to_string(),
                         format!("Find and fix bugs in this {language} code:\n{code}"),
                         (code.len() / 3 + 250).min(1200) as u32,
                         0.1f32,
@@ -2891,16 +2901,15 @@ Rules:\n\
 - Add short inline comments only on non-obvious lines\n\
 - NEVER remove, rename, or restructure any code — only add comment lines\n\
 - Use native comment syntax only: // for JS/TS/C/Java, # for Python/Ruby, -- for SQL\n\
-- No markdown fences, no ``` blocks, no asterisks, no preamble text before the code",
+- No markdown fences, no ``` blocks, no asterisks, no preamble text before the code".to_string(),
                         format!("Add comments to this {language} code:\n{code}"),
                         (code.len() / 3 + 400).min(1400) as u32,
                         0.1f32,
                     )
                 } else {
-                    // Generic fallback
                     (
                         "You are a code assistant in VS Code via CodeForge. Be concise and accurate.\n\
-- Plain text only. No asterisks, pound signs, or backtick fences. Max 150 words.",
+- Plain text only. No asterisks, pound signs, or backtick fences. Max 150 words.".to_string(),
                         format!("{verb}:\n{code}"),
                         300u32,
                         0.1f32,
